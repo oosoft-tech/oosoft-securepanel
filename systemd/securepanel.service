@@ -1,0 +1,34 @@
+[Unit]
+Description=SecurePanel API Backend
+After=securepanel-agent.service postgresql.service redis.service
+Requires=securepanel-agent.service
+
+[Service]
+Type=simple
+User=securepanel
+Group=securepanel
+WorkingDirectory=/opt/oosoft-securepanel/backend
+ExecStart=/opt/oosoft-securepanel/venv/bin/gunicorn app.main:app \
+    -w 4 -k uvicorn.workers.UvicornWorker \
+    --bind unix:/run/securepanel/api.sock \
+    --access-logfile /var/log/securepanel/access.log \
+    --error-logfile /var/log/securepanel/error.log \
+    --timeout 120
+
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+ReadWritePaths=/run/securepanel /var/log/securepanel /var/securepanel
+
+StandardOutput=append:/var/log/securepanel/app.log
+StandardError=append:/var/log/securepanel/app.log
+
+[Install]
+WantedBy=multi-user.target

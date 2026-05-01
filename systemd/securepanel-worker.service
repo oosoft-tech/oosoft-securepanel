@@ -1,0 +1,23 @@
+[Unit]
+Description=SecurePanel Celery Worker
+After=redis.service securepanel.service
+
+[Service]
+Type=simple
+User=securepanel
+Group=securepanel
+WorkingDirectory=/opt/oosoft-securepanel/backend
+ExecStart=/opt/oosoft-securepanel/venv/bin/celery \
+    -A app.tasks.celery_app worker \
+    --loglevel=info \
+    --concurrency=4 \
+    --logfile=/var/log/securepanel/worker.log
+
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

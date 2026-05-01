@@ -1,0 +1,56 @@
+server {
+    listen 80;
+    server_name {{ domain }} www.{{ domain }};
+    root {{ webroot }};
+    index index.php index.html index.htm;
+
+    access_log {{ log_dir }}/{{ domain }}_access.log;
+    error_log  {{ log_dir }}/{{ domain }}_error.log;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+
+    # Block hidden files
+    location ~ /\. {
+        deny all;
+        return 404;
+    }
+
+    # Block sensitive files
+    location ~* (wp-config\.php|\.env|composer\.(json|lock)|\.git|package\.json|\.htaccess) {
+        deny all;
+        return 404;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        try_files $fastcgi_script_name =404;
+
+        fastcgi_pass unix:{{ php_socket }};
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+
+        fastcgi_read_timeout 300;
+        fastcgi_connect_timeout 10;
+        fastcgi_buffer_size 128k;
+        fastcgi_buffers 4 256k;
+    }
+
+    # Let's Encrypt ACME challenge
+    location /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type "text/plain";
+    }
+
+    # Limit body size
+    client_max_body_size 64M;
+}

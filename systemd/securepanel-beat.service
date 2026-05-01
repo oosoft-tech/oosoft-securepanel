@@ -1,0 +1,19 @@
+[Unit]
+Description=SecurePanel Celery Beat Scheduler
+After=redis.service securepanel-worker.service
+
+[Service]
+Type=simple
+User=securepanel
+Group=securepanel
+WorkingDirectory=/opt/oosoft-securepanel/backend
+ExecStart=/opt/oosoft-securepanel/venv/bin/celery \
+    -A app.tasks.celery_app beat \
+    --loglevel=info \
+    --logfile=/var/log/securepanel/beat.log
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=SecurePanel Privileged Agent
+After=network.target
+Before=securepanel.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/oosoft-securepanel/venv/bin/python /opt/oosoft-securepanel/backend/agent/securepanel-agent.py
+Restart=always
+RestartSec=5
+
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/run/securepanel /var/log/securepanel /etc/nginx/sites-enabled /etc/php-fpm.d /home /etc/dovecot /etc/postfix /etc/opendkim
+
+StandardOutput=append:/var/log/securepanel/agent.log
+StandardError=append:/var/log/securepanel/agent.log
+
+[Install]
+WantedBy=multi-user.target
