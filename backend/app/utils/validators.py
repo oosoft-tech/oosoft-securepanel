@@ -35,6 +35,8 @@ _RESERVED_NAMES = frozenset({
     "test", "invalid", "broadcasthost",
 })
 
+# Panel account username pattern (for interactive login accounts)
+_RE_PANEL_USERNAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -84,7 +86,12 @@ def validate_domain(raw: str) -> str:
 
 def validate_username(raw: str) -> str:
     """
-    Validate a system username.
+    Validate a panel account username (interactive login account).
+
+    This is for the username a human chooses when signing up for the panel.
+    For the machine-derived per-domain Linux usernames use
+    app.utils.username.validate_linux_username instead.
+
     Returns the username on success, raises ValueError on failure.
     """
     if not isinstance(raw, str):
@@ -92,7 +99,13 @@ def validate_username(raw: str) -> str:
 
     username = raw.strip().lower()
 
-    if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", username):
-        raise ValueError("Invalid username format")
+    if not username:
+        raise ValueError("Username must not be empty")
+
+    if not _RE_PANEL_USERNAME.fullmatch(username):
+        raise ValueError(
+            "Username must start with a letter and contain only lowercase "
+            "letters, digits, and underscores (max 32 characters)"
+        )
 
     return username

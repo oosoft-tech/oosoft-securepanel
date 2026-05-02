@@ -2,10 +2,17 @@
 Agent command allowlist validator.
 
 Every action the privileged agent may execute must be registered here with:
-  - "params"     : list of accepted param keys (extras are rejected)
-  - "validators" : per-field regex patterns (fullmatch required)
+  "params"     : list of accepted param keys (extras are rejected)
+  "validators" : per-field regex patterns (fullmatch required)
+  "strict_params": True  →  extra keys beyond "params" are rejected
 
 The validator is initialized once at agent startup (not per-request).
+
+Param naming convention
+────────────────────────
+  "domain"         raw domain string     e.g. "example.com"
+  "username"       panel account name    e.g. "john"  (human login)
+  "linux_username" per-domain OS user    e.g. "example_com"  (isolation user)
 """
 import re
 from typing import Callable
@@ -14,7 +21,11 @@ from typing import Callable
 # Shared patterns — defined once, reused across entries
 # ---------------------------------------------------------------------------
 
-_RE_USERNAME  = r"^[a-z0-9_]{1,32}$"
+_RE_USERNAME       = r"^[a-z][a-z0-9_]{0,31}$"   # panel accounts
+_RE_LINUX_USERNAME = r"^[a-z][a-z0-9_]{0,31}$"   # per-domain isolation users
+                                                    # (same charset; separate name
+                                                    #  for readability and future
+                                                    #  divergence)
 _RE_DOMAIN    = r"^(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 _RE_PHP_VER   = r"^(7\.4|8\.[0-3])$"
 _RE_IP_CIDR   = r"^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$"
@@ -30,26 +41,28 @@ _RE_WEBROOT   = r"^/home/[a-z0-9_]{1,32}/public_html$"
 
 ALLOWED_ACTIONS: dict[str, dict] = {
 
-    # -- Domain (static site) provisioning ------------------------------------
+    # ── Domain (static site) provisioning ────────────────────────────────────
+    # linux_username: the per-domain isolation user derived from the domain.
+    # This replaces the old "username" (panel account) param — domains are now
+    # owned by their own dedicated OS user, not the panel account holder.
     "nginx.create_domain": {
-        "params": ["domain", "username"],
+        "params": ["domain", "linux_username"],
         "validators": {
-            "domain":   _RE_DOMAIN,
-            "username": _RE_USERNAME,
+            "domain":         _RE_DOMAIN,
+            "linux_username": _RE_LINUX_USERNAME,
         },
-        # Reject any extra keys — no undeclared params reach the handler
         "strict_params": True,
     },
     "nginx.delete_domain": {
-        "params": ["domain", "username"],
+        "params": ["domain", "linux_username"],
         "validators": {
-            "domain":   _RE_DOMAIN,
-            "username": _RE_USERNAME,
+            "domain":         _RE_DOMAIN,
+            "linux_username": _RE_LINUX_USERNAME,
         },
         "strict_params": True,
     },
 
-    # -- Nginx config management (PHP/CMS flow) --------------------------------
+    # ── Nginx config management (PHP/CMS flow) ────────────────────────────────
     "nginx.reload": {
         "params": [],
         "validators": {},
@@ -59,8 +72,7 @@ ALLOWED_ACTIONS: dict[str, dict] = {
         "validators": {
             "username": _RE_USERNAME,
             "domain":   _RE_DOMAIN,
-            # config_content is large and validated structurally by the
-            # nginx -t step in the handler; no regex here
+            # config_content validated structurally by nginx -t; no regex here
         },
     },
     "nginx.delete_vhost": {
@@ -72,7 +84,19 @@ ALLOWED_ACTIONS: dict[str, dict] = {
         "strict_params": True,
     },
 
-    # -- System user management -----------------------------------------------
+    # ── Per-domain isolation user provisioning ────────────────────────────────
+    # Called directly by nginx.create_domain internally; also exposed as an
+    # agent-protocol action for repair flows and admin tooling.
+    "user.ensure_domain_user": {
+        "params": ["domain", "linux_username"],
+        "validators": {
+            "domain":         _RE_DOMAIN,
+            "linux_username": _RE_LINUX_USERNAME,
+        },
+        "strict_params": True,
+    },
+
+    # ── Panel account management ──────────────────────────────────────────────
     "user.create": {
         "params": ["username", "uid", "shell"],
         "validators": {
@@ -91,7 +115,7 @@ ALLOWED_ACTIONS: dict[str, dict] = {
         "strict_params": True,
     },
 
-    # -- CageFS ----------------------------------------------------------------
+    # ── CageFS ───────────────────────────────────────────────────────────────
     "cagefs.enable": {
         "params": ["username"],
         "validators": {"username": _RE_USERNAME},
@@ -109,7 +133,7 @@ ALLOWED_ACTIONS: dict[str, dict] = {
         "strict_params": True,
     },
 
-    # -- Firewall --------------------------------------------------------------
+    # ── Firewall ─────────────────────────────────────────────────────────────
     "firewall.add_rule": {
         "params": ["ip", "action", "chain"],
         "validators": {
@@ -127,7 +151,7 @@ ALLOWED_ACTIONS: dict[str, dict] = {
     "firewall.list_rules":   {"params": [], "validators": {}},
     "firewall.load_ruleset": {"params": ["rules"], "validators": {}},
 
-    # -- SSL / Certbot ---------------------------------------------------------
+    # ── SSL / Certbot ─────────────────────────────────────────────────────────
     "ssl.issue": {
         "params": ["domain", "webroot"],
         "validators": {
@@ -147,7 +171,7 @@ ALLOWED_ACTIONS: dict[str, dict] = {
         "strict_params": True,
     },
 
-    # -- PHP-FPM ---------------------------------------------------------------
+    # ── PHP-FPM ───────────────────────────────────────────────────────────────
     "phpfpm.write_pool": {
         "params": ["username", "php_version", "config_content"],
         "validators": {
@@ -170,35 +194,38 @@ ALLOWED_ACTIONS: dict[str, dict] = {
 class CommandValidator:
     def __init__(self) -> None:
         from handlers import nginx, user, firewall, cagefs, ssl, phpfpm
+
         self._handlers: dict[str, Callable] = {
-            # Domain
-            "nginx.create_domain":   nginx.create_domain,
-            "nginx.delete_domain":   nginx.delete_domain,
-            # Nginx config
-            "nginx.reload":          nginx.reload,
-            "nginx.write_vhost":     nginx.write_vhost,
-            "nginx.delete_vhost":    nginx.delete_vhost,
-            # Users
-            "user.create":           user.create,
-            "user.delete":           user.delete,
-            "user.fix_ownership":    user.fix_ownership,
-            # CageFS
-            "cagefs.enable":         cagefs.enable,
-            "cagefs.disable":        cagefs.disable,
-            "cagefs.update_skeleton": cagefs.update_skeleton,
-            "cagefs.remount":        cagefs.remount,
-            # Firewall
-            "firewall.add_rule":     firewall.add_rule,
-            "firewall.delete_rule":  firewall.delete_rule,
-            "firewall.list_rules":   firewall.list_rules,
-            "firewall.load_ruleset": firewall.load_ruleset,
-            # SSL
-            "ssl.issue":             ssl.issue,
-            "ssl.renew":             ssl.renew,
-            "ssl.get_expiry":        ssl.get_expiry,
-            # PHP-FPM
-            "phpfpm.write_pool":     phpfpm.write_pool,
-            "phpfpm.reload":         phpfpm.reload,
+            # ── Domain provisioning ───────────────────────────────────────────
+            "nginx.create_domain":       nginx.create_domain,
+            "nginx.delete_domain":       nginx.delete_domain,
+            # ── Nginx config management ───────────────────────────────────────
+            "nginx.reload":              nginx.reload,
+            "nginx.write_vhost":         nginx.write_vhost,
+            "nginx.delete_vhost":        nginx.delete_vhost,
+            # ── Domain isolation users ────────────────────────────────────────
+            "user.ensure_domain_user":   user.ensure_domain_user_handler,
+            # ── Panel accounts ────────────────────────────────────────────────
+            "user.create":               user.create,
+            "user.delete":               user.delete,
+            "user.fix_ownership":        user.fix_ownership,
+            # ── CageFS ───────────────────────────────────────────────────────
+            "cagefs.enable":             cagefs.enable,
+            "cagefs.disable":            cagefs.disable,
+            "cagefs.update_skeleton":    cagefs.update_skeleton,
+            "cagefs.remount":            cagefs.remount,
+            # ── Firewall ─────────────────────────────────────────────────────
+            "firewall.add_rule":         firewall.add_rule,
+            "firewall.delete_rule":      firewall.delete_rule,
+            "firewall.list_rules":       firewall.list_rules,
+            "firewall.load_ruleset":     firewall.load_ruleset,
+            # ── SSL ───────────────────────────────────────────────────────────
+            "ssl.issue":                 ssl.issue,
+            "ssl.renew":                 ssl.renew,
+            "ssl.get_expiry":            ssl.get_expiry,
+            # ── PHP-FPM ───────────────────────────────────────────────────────
+            "phpfpm.write_pool":         phpfpm.write_pool,
+            "phpfpm.reload":             phpfpm.reload,
         }
 
     def is_allowed(self, action: str, params: dict) -> bool:
@@ -213,7 +240,7 @@ class CommandValidator:
 
         spec = ALLOWED_ACTIONS[action]
 
-        # Strict param check — reject extra keys when declared
+        # Strict param check — reject extra keys
         if spec.get("strict_params") and isinstance(params, dict):
             allowed_keys = set(spec.get("params", []))
             extra = set(params.keys()) - allowed_keys
