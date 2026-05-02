@@ -1,59 +1,82 @@
-import asyncio
+"""
+Firewall handler (nftables).
+All subprocess calls routed through utils.exec.run_command().
+"""
 import json
+import logging
+
+from utils.exec import run_command, CommandError
+
+logger = logging.getLogger(__name__)
 
 
 async def add_rule(params: dict) -> dict:
-    ip = params["ip"]
+    ip     = params["ip"]
     action = params["action"]
-    chain = params["chain"]
+    chain  = params["chain"]
 
-    proc = await asyncio.create_subprocess_exec(
-        "nft", "add", "element", "inet", "securepanel", "blocklist",
-        f"{{ {ip} }}",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"nft error: {stderr.decode()}")
+    # nft set element syntax: "{ 1.2.3.4 }"
+    # Each token is a separate list element — NO shell interpolation possible
+    try:
+        await run_command([
+            "nft", "add", "element",
+            "inet", "securepanel", "blocklist",
+            "{", ip, "}",
+        ])
+    except CommandError as exc:
+        logger.error("nft add_rule failed rc=%d", exc.result.returncode)
+        raise RuntimeError("Failed to add firewall rule") from exc
+
+    logger.info("Firewall rule added: ip=%s action=%s chain=%s", ip, action, chain)
     return {"ip": ip, "action": action, "added": True}
 
 
 async def delete_rule(params: dict) -> dict:
     rule_id = params["rule_id"]
-    proc = await asyncio.create_subprocess_exec(
-        "nft", "delete", "rule", "inet", "securepanel", "input_filter",
-        "handle", rule_id,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"nft delete error: {stderr.decode()}")
+
+    try:
+        await run_command([
+            "nft", "delete", "rule",
+            "inet", "securepanel", "input_filter",
+            "handle", rule_id,
+        ])
+    except CommandError as exc:
+        logger.error("nft delete_rule failed rc=%d", exc.result.returncode)
+        raise RuntimeError("Failed to delete firewall rule") from exc
+
+    logger.info("Firewall rule deleted: rule_id=%s", rule_id)
     return {"deleted": True, "rule_id": rule_id}
 
 
 async def list_rules(params: dict) -> dict:
-    proc = await asyncio.create_subprocess_exec(
-        "nft", "-j", "list", "table", "inet", "securepanel",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"nft list error: {stderr.decode()}")
-    return {"rules": json.loads(stdout.decode())}
+    try:
+        result = await run_command([
+            "nft", "-j", "list", "table", "inet", "securepanel",
+        ])
+    except CommandError as exc:
+        logger.error("nft list_rules failed rc=%d", exc.result.returncode)
+        raise RuntimeError("Failed to list firewall rules") from exc
+
+    try:
+        rules = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        logger.error("nft output is not valid JSON: %s", exc)
+        raise RuntimeError("Failed to parse firewall rules") from exc
+
+    return {"rules": rules}
 
 
 async def load_ruleset(params: dict) -> dict:
     rules = params["rules"]
-    proc = await asyncio.create_subprocess_exec(
-        "nft", "-f", "-",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate(input=rules.encode())
-    if proc.returncode != 0:
-        raise RuntimeError(f"nft ruleset load error: {stderr.decode()}")
+
+    try:
+        await run_command(
+            ["nft", "-f", "-"],
+            stdin_data=rules.encode("utf-8"),
+        )
+    except CommandError as exc:
+        logger.error("nft load_ruleset failed rc=%d", exc.result.returncode)
+        raise RuntimeError("Failed to load nftables ruleset") from exc
+
+    logger.info("nftables ruleset loaded successfully")
     return {"loaded": True}
