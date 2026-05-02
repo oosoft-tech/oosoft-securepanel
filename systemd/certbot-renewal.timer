@@ -1,0 +1,25 @@
+[Unit]
+Description=Twice-Daily Certbot Renewal Timer — Oosoft SecurePanel
+Documentation=https://certbot.eff.org/docs/
+# Persist missed activations across reboots (if the server was down at
+# the scheduled time, run as soon as it comes back up).
+After=network-online.target
+
+[Timer]
+# Run at 03:00 and 15:00 every day.
+# Let's Encrypt recommends running twice daily so a failed attempt has
+# a second chance before expiry-alert thresholds are reached.
+OnCalendar=*-*-* 03,15:00:00
+
+# Add a random delay of up to 1 hour to spread renewal load across the
+# LE infrastructure and avoid thundering-herd from thousands of servers
+# all renewing at exactly 03:00:00.
+RandomizedDelaySec=3600
+
+# Run once immediately after boot if the last run was missed.
+Persistent=true
+
+Unit=certbot-renewal.service
+
+[Install]
+WantedBy=timers.target
