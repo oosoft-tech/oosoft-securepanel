@@ -4,6 +4,9 @@
 # =============================================================================
 # Supported:  AlmaLinux 8 / 9  ·  Ubuntu 22.04 LTS
 #
+# Idempotent — safe to run on a fresh server or on an existing installation.
+# Re-running upgrades code, fixes permissions, and restarts only what changed.
+#
 # Basic usage (SSL configured later):
 #   curl -sSL https://oosoft.co.in/install.sh | bash
 #
@@ -16,17 +19,21 @@
 #   PANEL_YES=1 bash install.sh
 #
 # Environment overrides:
-#   PANEL_DOMAIN   Hostname for the panel (e.g. panel.example.com)
-#   ADMIN_EMAIL    Email for Let's Encrypt notifications
-#   PANEL_YES=1    Skip all confirmation prompts
-#   REPO_URL       Override Git repository URL
-#   DB_PASSWORD    Use a specific DB password (auto-generated if unset)
+#   PANEL_DOMAIN      Hostname for the panel  (e.g. panel.example.com)
+#   ADMIN_EMAIL       Email for Let's Encrypt notifications
+#   PANEL_YES=1       Skip all confirmation prompts
+#   REPO_URL          Override Git repository URL
+#   DB_PASSWORD       Use a specific DB password (auto-generated if unset)
+#   FORCE_VENV=1      Recreate the Python venv even if it already looks good
+#   FORCE_NGINX=1     Overwrite the nginx config even if HTTPS is already live
 # =============================================================================
 set -euo pipefail
 IFS=$'\n\t'
 
-# ─── Constants ────────────────────────────────────────────────────────────────
-readonly INSTALLER_VERSION="1.0.0"
+# ─── Version ──────────────────────────────────────────────────────────────────
+readonly INSTALLER_VERSION="1.1.0"
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
 readonly INSTALL_DIR="/opt/oosoft-securepanel"
 readonly VENV_DIR="${INSTALL_DIR}/venv"
 readonly BACKEND_DIR="${INSTALL_DIR}/backend"
@@ -35,24 +42,35 @@ readonly LOG_DIR="/var/log/securepanel"
 readonly RUN_DIR="/run/securepanel"
 readonly STATE_DIR="/var/securepanel"
 readonly ACME_WEBROOT="/var/www/letsencrypt"
-readonly PANEL_USER="securepanel"
-readonly PANEL_GROUP="securepanel"
-readonly HOSTING_GROUP="securepanel_users"
 readonly NGINX_CONF_D="/etc/nginx/conf.d"
 readonly NGINX_SNIPPETS="/etc/nginx/snippets"
 readonly INSTALL_LOG="/var/log/securepanel-install.log"
 
-# Operator-configurable (via env vars, not readonly)
+# State file — persists metadata about the installed panel across runs
+readonly STATE_FILE="${INSTALL_DIR}/.panel-state"
+
+# ─── Fixed identities ────────────────────────────────────────────────────────
+readonly PANEL_USER="securepanel"
+readonly PANEL_GROUP="securepanel"
+readonly HOSTING_GROUP="securepanel_users"
+readonly REQUIRED_PYTHON_MINOR="11"   # require 3.11.x
+
+# ─── Operator-configurable (env vars) ────────────────────────────────────────
 PANEL_DOMAIN="${PANEL_DOMAIN:-}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-}"
 PANEL_YES="${PANEL_YES:-0}"
 REPO_URL="${REPO_URL:-https://github.com/oosoft-tech/oosoft-securepanel.git}"
 DB_PASSWORD="${DB_PASSWORD:-}"
 SECRET_KEY="${SECRET_KEY:-}"
+FORCE_VENV="${FORCE_VENV:-0}"
+FORCE_NGINX="${FORCE_NGINX:-0}"
 
-# Runtime state
-OS_FAMILY=""    # "rhel" | "debian"
-OS_CODENAME=""  # "al8" | "al9" | "jammy"
+# ─── Runtime state (set during execution) ────────────────────────────────────
+OS_FAMILY=""            # "rhel" | "debian"
+OS_CODENAME=""          # "al8" | "al9" | "jammy"
+IS_UPGRADE=0            # 1 when an existing installation is detected
+PREV_VERSION=""         # version string from the state file
+UNITS_CHANGED=0         # 1 when at least one systemd unit was updated
 
 # ─── Colours (disabled when stdout is not a terminal) ─────────────────────────
 if [[ -t 1 ]]; then
@@ -63,14 +81,13 @@ else
 fi
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-# Pre-create the log file parent (LOG_DIR may not exist yet at script start)
 mkdir -p "$(dirname "$INSTALL_LOG")"
-
 _ts()  { date '+%H:%M:%S'; }
 log()  { echo -e "${GREEN}▶${NC}  [$(_ts)] $*"   | tee -a "$INSTALL_LOG"; }
 info() { echo -e "      ${DIM}$*${NC}"            | tee -a "$INSTALL_LOG"; }
 warn() { echo -e "${YELLOW}⚠${NC}  [$(_ts)] $*"  | tee -a "$INSTALL_LOG"; }
 err()  { echo -e "${RED}✗${NC}  [$(_ts)] $*"      | tee -a "$INSTALL_LOG" >&2; }
+skip() { echo -e "      ${DIM}↷  $* — skipped (already done)${NC}" | tee -a "$INSTALL_LOG"; }
 die()  { err "$*"; exit 1; }
 step() {
     echo | tee -a "$INSTALL_LOG"
@@ -82,8 +99,64 @@ trap '_on_error $LINENO' ERR
 _on_error() {
     err "Fatal error at line $1."
     err "Full log: $INSTALL_LOG"
-    err "Fix the issue and re-run — the installer is idempotent."
+    err "The installer is idempotent — fix the issue and re-run."
     exit 1
+}
+
+# =============================================================================
+# .ENV HELPERS
+# Interact with backend/.env safely — never lose existing values.
+# =============================================================================
+
+# Return the value of KEY from .env, or empty string.
+_env_get() {
+    local key="$1" env="${BACKEND_DIR}/.env"
+    [[ -f "$env" ]] || { echo ""; return; }
+    grep -Po "(?<=^${key}=).+" "$env" 2>/dev/null || echo ""
+}
+
+# Return 0 if KEY is present and non-empty in .env.
+_env_has() {
+    local key="$1"
+    local val
+    val=$(_env_get "$key")
+    [[ -n "$val" ]]
+}
+
+# Append KEY=VALUE to .env only if KEY is not already set.
+# Never overwrites an existing value — safe to call unconditionally.
+_env_ensure() {
+    local key="$1" value="$2" env="${BACKEND_DIR}/.env"
+    if _env_has "$key"; then
+        return 0  # already there — leave it alone
+    fi
+    echo "${key}=${value}" >> "$env"
+    info "  .env ← added: $key"
+}
+
+# =============================================================================
+# STATE FILE
+# Tracks installed version and first-install metadata across runs.
+# =============================================================================
+
+_read_state() {
+    [[ -f "$STATE_FILE" ]] || return 0
+    # shellcheck source=/dev/null
+    source "$STATE_FILE" 2>/dev/null || true
+    PREV_VERSION="${PANEL_STATE_VERSION:-}"
+}
+
+_write_state() {
+    mkdir -p "$(dirname "$STATE_FILE")"
+    cat > "$STATE_FILE" << EOF
+# Oosoft SecurePanel — installation state
+# Written by install.sh — do not edit manually.
+PANEL_STATE_VERSION=${INSTALLER_VERSION}
+PANEL_STATE_DATE=$(date -Iseconds)
+PANEL_STATE_DOMAIN=${PANEL_DOMAIN:-}
+PANEL_STATE_OS=${OS_CODENAME:-unknown}
+EOF
+    chmod 600 "$STATE_FILE"
 }
 
 # =============================================================================
@@ -93,13 +166,11 @@ _on_error() {
 detect_os() {
     step "Detecting operating system"
 
-    [[ -f /etc/os-release ]] || die "/etc/os-release not found — cannot determine OS."
-
+    [[ -f /etc/os-release ]] || die "/etc/os-release not found."
     # shellcheck source=/dev/null
     source /etc/os-release
 
-    local id="${ID:-unknown}"
-    local ver="${VERSION_ID:-0}"
+    local id="${ID:-unknown}" ver="${VERSION_ID:-0}"
 
     case "$id" in
         almalinux|alma)
@@ -107,18 +178,18 @@ detect_os() {
             case "${ver%%.*}" in
                 8) OS_CODENAME="al8" ;;
                 9) OS_CODENAME="al9" ;;
-                *) die "AlmaLinux ${ver} is not supported. Supported: 8, 9." ;;
+                *) die "AlmaLinux ${ver} not supported. Supported: 8, 9." ;;
             esac
             ;;
         ubuntu)
             OS_FAMILY="debian"
             case "$ver" in
                 22.04) OS_CODENAME="jammy" ;;
-                *)     die "Ubuntu ${ver} is not supported. Supported: 22.04." ;;
+                *)     die "Ubuntu ${ver} not supported. Supported: 22.04." ;;
             esac
             ;;
         *)
-            die "OS '${id}' is not supported. Supported: AlmaLinux 8/9, Ubuntu 22.04."
+            die "OS '${id}' not supported. Supported: AlmaLinux 8/9, Ubuntu 22.04."
             ;;
     esac
 
@@ -126,31 +197,25 @@ detect_os() {
 }
 
 # =============================================================================
-# PREFLIGHT CHECKS
+# PREFLIGHT
 # =============================================================================
 
 check_root() {
-    [[ $EUID -eq 0 ]] || die "Must be run as root.  Try:  sudo bash $0"
+    [[ $EUID -eq 0 ]] || die "Must run as root.  Try:  sudo bash $0"
 }
 
 check_resources() {
-    local ram_kb disk_avail_kb
+    local ram_kb disk_kb
     ram_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    disk_avail_kb=$(df --output=avail / 2>/dev/null | tail -1 || echo 0)
-
-    (( ram_kb >= 786432 )) || \
-        warn "< 1 GB RAM detected (${ram_kb} kB). Panel may run slowly."
-    (( disk_avail_kb >= 4194304 )) || \
-        warn "< 4 GB free on /  (${disk_avail_kb} kB). Ensure enough disk space."
-
-    info "RAM:  $(( ram_kb / 1024 )) MB    Disk free: $(( disk_avail_kb / 1024 )) MB"
+    disk_kb=$(df --output=avail / 2>/dev/null | tail -1 || echo 0)
+    (( ram_kb  >= 786432  )) || warn "< 1 GB RAM (${ram_kb} kB). Panel may be slow."
+    (( disk_kb >= 4194304 )) || warn "< 4 GB free on / (${disk_kb} kB)."
+    info "RAM: $(( ram_kb / 1024 )) MB   Disk free: $(( disk_kb / 1024 )) MB"
 }
 
 confirm() {
-    # Usage: confirm "Do you want to ...?" || die "cancelled"
     [[ "$PANEL_YES" == "1" ]] && return 0
     local answer
-    # Works even when stdin is a pipe (curl | bash) by reading from /dev/tty
     if [[ -e /dev/tty ]]; then
         read -r -p "$* [y/N] " answer </dev/tty
     else
@@ -161,6 +226,7 @@ confirm() {
 
 # =============================================================================
 # PACKAGE INSTALLATION
+# Idempotent: dnf/apt skip already-installed packages automatically.
 # =============================================================================
 
 install_packages() {
@@ -171,48 +237,41 @@ install_packages() {
         debian) _install_packages_debian ;;
     esac
 
-    command -v python3.11 &>/dev/null || die "python3.11 not found after package install."
+    command -v python3.11 &>/dev/null || die "python3.11 not found after install."
     log "Python: $(python3.11 --version)"
     log "nginx:  $(nginx -v 2>&1 | head -1)"
     log "git:    $(git --version)"
 }
 
 _install_packages_rhel() {
-    log "Updating system (dnf)..."
+    log "Updating packages (dnf)..."
     dnf -y -q update
 
-    log "Installing EPEL repository..."
+    # EPEL — idempotent (dnf skips if already installed)
     dnf -y -q install epel-release
 
-    # Enable CodeReady Builder / PowerTools (provides -devel packages)
+    # Enable CRB/PowerTools repo for -devel packages
     dnf -y -q install dnf-plugins-core
     if [[ "$OS_CODENAME" == "al9" ]]; then
-        dnf config-manager --set-enabled crb 2>/dev/null || true
+        dnf config-manager --set-enabled crb          2>/dev/null || true
     else
-        dnf config-manager --set-enabled powertools 2>/dev/null || \
-        dnf config-manager --set-enabled PowerTools 2>/dev/null || true
+        dnf config-manager --set-enabled powertools   2>/dev/null || \
+        dnf config-manager --set-enabled PowerTools   2>/dev/null || true
     fi
 
-    log "Installing core packages..."
     dnf -y -q install \
         curl wget git tar unzip openssl \
-        nginx \
-        redis \
+        nginx redis \
         certbot python3-certbot-nginx \
         python3.11 python3.11-devel python3.11-pip \
-        postgresql-server postgresql postgresql-contrib \
-        libpq-devel \
-        gcc gcc-c++ make \
-        firewalld \
-        logrotate \
-        rsync \
-        bind-utils       # provides getent / nslookup for DNS checks
+        postgresql-server postgresql postgresql-contrib libpq-devel \
+        gcc gcc-c++ make firewalld logrotate rsync bind-utils
 
-    # python3.11 might need module install on older AL8 builds
+    # Fallback for older AL8 builds where python3.11 needs module install
     if ! command -v python3.11 &>/dev/null; then
-        dnf -y -q module enable python3.11 2>/dev/null && \
+        dnf -y -q module enable  python3.11 2>/dev/null && \
         dnf -y -q module install python3.11 || \
-        die "Could not install Python 3.11. Install it manually and re-run."
+        die "Could not install Python 3.11. Install manually and re-run."
     fi
 }
 
@@ -222,145 +281,135 @@ _install_packages_debian() {
     log "Updating package cache (apt)..."
     apt-get -y -qq update
 
-    log "Installing prerequisites..."
     apt-get -y -qq install \
-        curl wget git tar unzip openssl software-properties-common \
-        gnupg2 lsb-release
+        curl wget git tar unzip openssl \
+        software-properties-common gnupg2 lsb-release
 
-    # Python 3.11 is in deadsnakes PPA for reliable install on 22.04
-    log "Adding deadsnakes PPA for Python 3.11..."
-    add-apt-repository -y ppa:deadsnakes/python 2>/dev/null || true
-    apt-get -y -qq update
+    # Add deadsnakes PPA only if not already present — prevents duplicate entries
+    if ! grep -rq "deadsnakes/python" /etc/apt/sources.list.d/ /etc/apt/sources.list \
+            2>/dev/null; then
+        log "Adding deadsnakes PPA for Python 3.11..."
+        add-apt-repository -y ppa:deadsnakes/python 2>/dev/null || true
+        apt-get -y -qq update
+    else
+        info "deadsnakes PPA already configured — skipping."
+    fi
 
-    log "Installing core packages..."
     apt-get -y -qq install \
-        nginx \
-        redis-server \
+        nginx redis-server \
         certbot python3-certbot-nginx \
         python3.11 python3.11-dev python3.11-venv \
         postgresql postgresql-client libpq-dev \
-        gcc g++ make \
-        ufw \
-        logrotate \
-        rsync \
-        dnsutils       # provides getent / dig for DNS checks
+        gcc g++ make ufw logrotate rsync dnsutils
 }
 
 # =============================================================================
 # SYSTEM USERS AND GROUPS
+# Idempotent: all creation paths are guarded with existence checks.
 # =============================================================================
 
 setup_users() {
     step "Creating system users and groups"
 
-    # Panel service group
     if ! getent group "$PANEL_GROUP" &>/dev/null; then
         groupadd --system "$PANEL_GROUP"
         info "Created group: $PANEL_GROUP"
     else
-        info "Group '$PANEL_GROUP' already exists."
+        skip "Group '$PANEL_GROUP'"
     fi
 
-    # Hosting isolation group (all per-domain Linux users join this)
     if ! getent group "$HOSTING_GROUP" &>/dev/null; then
         groupadd --system "$HOSTING_GROUP"
         info "Created group: $HOSTING_GROUP"
     else
-        info "Group '$HOSTING_GROUP' already exists."
+        skip "Group '$HOSTING_GROUP'"
     fi
 
-    # Panel service account — no interactive login
     if ! id -u "$PANEL_USER" &>/dev/null; then
-        useradd \
-            --system \
-            --gid    "$PANEL_GROUP" \
-            --shell  /sbin/nologin \
-            --home   "$INSTALL_DIR" \
+        useradd --system \
+            --gid "$PANEL_GROUP" \
+            --shell /sbin/nologin \
+            --home "$INSTALL_DIR" \
             --no-create-home \
             "$PANEL_USER"
         info "Created system user: $PANEL_USER"
     else
-        info "User '$PANEL_USER' already exists."
+        skip "User '$PANEL_USER'"
     fi
 
-    # Add nginx worker to securepanel group so it can traverse /run/securepanel
-    # and read the Unix socket created by the agent.
+    # Add the nginx worker user to securepanel group so it can reach the socket.
+    # usermod -aG is idempotent — adding an already-member is a no-op.
     if id nginx &>/dev/null; then
         usermod -aG "$PANEL_GROUP" nginx 2>/dev/null || true
-        info "nginx added to group '$PANEL_GROUP'."
+        info "nginx → member of '$PANEL_GROUP'"
     elif id www-data &>/dev/null; then
         usermod -aG "$PANEL_GROUP" www-data 2>/dev/null || true
-        info "www-data added to group '$PANEL_GROUP'."
+        info "www-data → member of '$PANEL_GROUP'"
     fi
 }
 
 # =============================================================================
 # DIRECTORY STRUCTURE
+# mkdir -p, chown, and chmod are all idempotent by definition.
+# The tmpfiles.d content is deterministic — overwriting is harmless.
 # =============================================================================
 
 setup_directories() {
     step "Creating directory structure"
 
-    # Application root — root:root, group-readable
+    # Application root
     mkdir -p "$INSTALL_DIR"
     chown root:root "$INSTALL_DIR"
     chmod 755 "$INSTALL_DIR"
 
-    # Persistent logs — owned by the panel service account
+    # Log directory
     mkdir -p "$LOG_DIR"
     chown "$PANEL_USER:$PANEL_GROUP" "$LOG_DIR"
     chmod 750 "$LOG_DIR"
 
-    # State / upload directory
+    # Persistent state / uploads
     mkdir -p "${STATE_DIR}/migration_uploads"
     chown -R "$PANEL_USER:$PANEL_GROUP" "$STATE_DIR"
     chmod 750 "$STATE_DIR"
 
-    # ACME webroot — nginx must be able to read challenges
+    # ACME webroot
     mkdir -p "${ACME_WEBROOT}/.well-known/acme-challenge"
     chmod 755 "$ACME_WEBROOT"
-    # Determine nginx user
     local nginx_user="nginx"
     id nginx &>/dev/null || nginx_user="www-data"
     chown -R "${nginx_user}:${nginx_user}" "$ACME_WEBROOT"
 
-    # Volatile runtime directory (/run is tmpfs, wiped on reboot)
-    # Create now for immediate use; tmpfiles.d re-creates it on next boot.
+    # Volatile runtime dir — wiped on reboot, tmpfiles.d recreates it
     mkdir -p "$RUN_DIR"
     chown "root:$PANEL_GROUP" "$RUN_DIR"
     chmod 750 "$RUN_DIR"
 
-    # tmpfiles.d — survives reboots
+    # tmpfiles.d entry
     cat > /etc/tmpfiles.d/securepanel.conf << EOF
-# Oosoft SecurePanel — recreate volatile runtime dir on boot
-# Mode 0750: root can read/write/exec; securepanel group can read/exec
+# Oosoft SecurePanel — volatile runtime directory
 d ${RUN_DIR} 0750 root ${PANEL_GROUP} -
 EOF
     systemd-tmpfiles --create /etc/tmpfiles.d/securepanel.conf
-    info "tmpfiles.d: $RUN_DIR will be recreated on every boot."
+    info "tmpfiles.d: $RUN_DIR recreated on every boot."
 
-    # nginx dirs
     mkdir -p "$NGINX_CONF_D" "$NGINX_SNIPPETS"
 
-    log "Directory structure: OK"
-    info "  $INSTALL_DIR     (application root)"
-    info "  $LOG_DIR         (logs)"
-    info "  $STATE_DIR        (state / uploads)"
-    info "  $ACME_WEBROOT (ACME webroot)"
-    info "  $RUN_DIR    (agent + API sockets)"
+    log "Directories: OK"
 }
 
 # =============================================================================
 # REPOSITORY CLONE / UPDATE
+# Fresh server: clone.  Existing install: fast-forward pull only.
 # =============================================================================
 
 clone_repo() {
     step "Deploying application from repository"
 
     if [[ -d "${INSTALL_DIR}/.git" ]]; then
-        log "Repository already present — pulling latest code..."
+        log "Repository present — pulling latest code..."
         git -C "$INSTALL_DIR" fetch --quiet origin
-        git -C "$INSTALL_DIR" reset --hard origin/main 2>/dev/null || \
+        # Reset to remote HEAD (upgrade path)
+        git -C "$INSTALL_DIR" reset --hard origin/main  2>/dev/null || \
         git -C "$INSTALL_DIR" reset --hard origin/master 2>/dev/null || \
         warn "Could not update repository — continuing with existing code."
     else
@@ -368,84 +417,116 @@ clone_repo() {
         git clone --depth=1 "$REPO_URL" "$INSTALL_DIR"
     fi
 
-    # Sanity checks
-    [[ -d "$BACKEND_DIR" ]]                  || die "backend/ not found in repo."
+    [[ -d "$BACKEND_DIR" ]]                   || die "backend/ not found in repo."
     [[ -f "${BACKEND_DIR}/requirements.txt" ]] || die "requirements.txt not found."
 
-    # Ownership: root owns the code, securepanel group can read it
+    # root owns the code; securepanel group can read and traverse; no world access
     chown -R "root:$PANEL_GROUP" "$INSTALL_DIR"
-    chmod -R o-rwx "$INSTALL_DIR"    # no world access
-    chmod -R g+rX  "$INSTALL_DIR"    # group can read + traverse
+    chmod -R o-rwx "$INSTALL_DIR"
+    chmod -R g+rX  "$INSTALL_DIR"
+    chmod 750 "$BACKEND_DIR"   # .env lives here
 
-    # The .env will be written here — ensure the directory is writable by root
-    chmod 750 "$BACKEND_DIR"
-
-    log "Repository: $INSTALL_DIR"
+    log "Repository: OK"
 }
 
 # =============================================================================
 # PYTHON VIRTUAL ENVIRONMENT
+# Skip recreation if the venv already exists with the correct Python version.
+# On upgrade: only pip-install upgraded/new packages.
 # =============================================================================
 
 setup_venv() {
-    step "Setting up Python 3.11 virtual environment"
+    step "Setting up Python virtual environment"
 
-    log "Creating venv at $VENV_DIR ..."
-    python3.11 -m venv "$VENV_DIR"
+    local python_bin="${VENV_DIR}/bin/python"
+    local recreate=1
+
+    if [[ "$FORCE_VENV" != "1" ]] && [[ -x "$python_bin" ]]; then
+        # Check if the existing venv uses the required Python minor version
+        local existing_ver
+        existing_ver=$("$python_bin" --version 2>/dev/null \
+                       | grep -oP '3\.\K\d+' | head -1 || echo "0")
+        if [[ "$existing_ver" == "$REQUIRED_PYTHON_MINOR" ]]; then
+            skip "venv (Python 3.${REQUIRED_PYTHON_MINOR} already in place)"
+            recreate=0
+        else
+            warn "Existing venv uses Python 3.${existing_ver} (need 3.${REQUIRED_PYTHON_MINOR}) — recreating."
+            rm -rf "$VENV_DIR"
+        fi
+    fi
+
+    if [[ "$recreate" == "1" ]]; then
+        log "Creating venv at $VENV_DIR ..."
+        python3.11 -m venv "$VENV_DIR"
+    fi
 
     log "Upgrading pip / setuptools / wheel..."
     "$VENV_DIR/bin/pip" install --quiet --upgrade pip setuptools wheel
 
-    log "Installing Python dependencies (this may take a few minutes)..."
-    "$VENV_DIR/bin/pip" install --quiet -r "${BACKEND_DIR}/requirements.txt"
+    log "Installing / upgrading Python dependencies..."
+    "$VENV_DIR/bin/pip" install --quiet --upgrade -r "${BACKEND_DIR}/requirements.txt"
 
-    # Ownership: root owns, group can execute
     chown -R "root:$PANEL_GROUP" "$VENV_DIR"
     chmod -R o-rwx "$VENV_DIR"
     chmod -R g+rX  "$VENV_DIR"
 
-    log "venv: OK  (Python: $("$VENV_DIR/bin/python" --version))"
+    log "venv: OK  (Python: $("$python_bin" --version))"
 }
 
 # =============================================================================
 # POSTGRESQL SETUP
+# Idempotent: role + DB creation are guarded; pg_hba only patched once.
 # =============================================================================
 
 setup_postgresql() {
     step "Configuring PostgreSQL"
 
-    # Generate a secure random password if not provided
+    # On upgrade: read DB password from existing .env rather than generating
+    # a new one (which would break the database connection).
+    if [[ -z "$DB_PASSWORD" ]]; then
+        local existing_url
+        existing_url=$(_env_get "DATABASE_URL")
+        if [[ -n "$existing_url" ]]; then
+            # Extract password from: postgresql+asyncpg://user:PASS@host/db
+            DB_PASSWORD=$(echo "$existing_url" \
+                | grep -oP '(?<=://securepanel:)[^@]+' || true)
+            [[ -n "$DB_PASSWORD" ]] \
+                && info "Reusing DB password from existing .env." \
+                || DB_PASSWORD=""
+        fi
+    fi
+
+    # Generate only if still unset
     if [[ -z "$DB_PASSWORD" ]]; then
         DB_PASSWORD=$("${VENV_DIR}/bin/python" -c \
             "import secrets; print(secrets.token_urlsafe(32))")
+        info "Generated new DB password."
     fi
 
     case "$OS_FAMILY" in
         rhel)
-            # AlmaLinux ships PostgreSQL without an initialised data directory
             if [[ ! -f /var/lib/pgsql/data/PG_VERSION ]]; then
                 log "Initialising PostgreSQL data directory..."
                 postgresql-setup --initdb
+            else
+                skip "PostgreSQL data directory (already initialised)"
             fi
             systemctl enable --now postgresql
             ;;
         debian)
-            # Ubuntu auto-initialises on package install
             systemctl enable --now postgresql
             ;;
     esac
 
-    # Wait up to 20 s for PostgreSQL to accept connections
-    log "Waiting for PostgreSQL to be ready..."
+    log "Waiting for PostgreSQL..."
     local retries=10
     until sudo -u postgres pg_isready -q 2>/dev/null; do
         (( retries-- ))
-        (( retries > 0 )) || die "PostgreSQL did not become ready after 20 seconds."
+        (( retries > 0 )) || die "PostgreSQL did not become ready in time."
         sleep 2
     done
-    info "PostgreSQL: accepting connections."
 
-    # Idempotent: create the securepanel role (or update its password)
+    # Idempotent role management: create if absent, otherwise just update password
     sudo -u postgres psql -v ON_ERROR_STOP=0 -q <<SQL
 DO \$\$
 BEGIN
@@ -458,145 +539,170 @@ END
 \$\$;
 SQL
 
-    # Create the database (idempotent — error suppressed if it already exists)
     sudo -u postgres createdb -O securepanel securepanel 2>/dev/null \
-        || info "Database 'securepanel' already exists."
+        || skip "Database 'securepanel' (already exists)"
 
-    # On RHEL/AlmaLinux the default pg_hba.conf uses ident auth for localhost.
-    # Add an explicit md5 entry for the securepanel user so asyncpg can connect.
+    # RHEL only: inject md5 auth row if not already present
     if [[ "$OS_FAMILY" == "rhel" ]]; then
         local pg_hba
         pg_hba=$(sudo -u postgres psql -At -c "SHOW hba_file;" 2>/dev/null \
                  | tr -d ' ')
-        if [[ -n "$pg_hba" ]] && ! grep -q "^host.*securepanel.*securepanel" "$pg_hba" 2>/dev/null; then
-            # Insert before the first "host" line
-            sed -i '/^host/i # Oosoft SecurePanel — md5 auth for securepanel user\nhost    securepanel     securepanel     127.0.0.1\/32     md5\nhost    securepanel     securepanel     ::1\/128          md5' \
+        if [[ -n "$pg_hba" ]] \
+           && ! grep -q "^host.*securepanel.*securepanel" "$pg_hba" 2>/dev/null; then
+            sed -i \
+                '/^host/i # Oosoft SecurePanel\nhost    securepanel     securepanel     127.0.0.1\/32     md5\nhost    securepanel     securepanel     ::1\/128          md5' \
                 "$pg_hba"
             systemctl reload postgresql
-            info "pg_hba.conf: md5 auth added for securepanel@127.0.0.1"
+            info "pg_hba.conf: md5 auth added."
+        else
+            skip "pg_hba.conf (securepanel entry already present)"
         fi
     fi
 
-    log "PostgreSQL: database 'securepanel' ready."
+    log "PostgreSQL: ready."
 }
 
 # =============================================================================
-# REDIS CHECK
+# REDIS
 # =============================================================================
 
 setup_redis() {
     step "Configuring Redis"
 
-    # Service name differs between distros
     local redis_svc="redis"
-    systemctl enable "$redis_svc" 2>/dev/null \
-        || { redis_svc="redis-server"; systemctl enable "$redis_svc"; }
-    systemctl start "$redis_svc" || warn "Could not start Redis — check: journalctl -u $redis_svc"
+    if ! systemctl enable "$redis_svc" 2>/dev/null; then
+        redis_svc="redis-server"
+        systemctl enable "$redis_svc" \
+            || warn "Could not enable Redis — start it manually."
+    fi
+    systemctl start "$redis_svc" 2>/dev/null \
+        || warn "Could not start Redis — check: journalctl -u $redis_svc"
 
-    # Connectivity test
     if command -v redis-cli &>/dev/null; then
         local pong
         pong=$(redis-cli ping 2>/dev/null || echo "FAIL")
-        if [[ "$pong" == "PONG" ]]; then
-            log "Redis: OK (PONG received)"
-        else
-            warn "Redis did not respond to PING ($pong) — check the service."
-        fi
+        [[ "$pong" == "PONG" ]] \
+            && log "Redis: OK" \
+            || warn "Redis PING failed ($pong)."
     fi
 }
 
 # =============================================================================
 # ENVIRONMENT FILE (.env)
+#
+# Idempotency rules:
+#   • Fresh install  — write the full template.
+#   • Re-run / upgrade — NEVER overwrite existing keys.
+#     We only append keys that are entirely missing from the file.
+#     SECRET_KEY and DATABASE_URL are preserved 100% of the time.
 # =============================================================================
 
 generate_env() {
-    step "Generating application configuration (.env)"
+    step "Configuring .env"
 
     local env_file="${BACKEND_DIR}/.env"
     local python_bin="${VENV_DIR}/bin/python"
 
-    # Preserve an existing .env (operator may have already customised it)
     if [[ -f "$env_file" ]]; then
-        local backup="${env_file}.bak.$(date +%Y%m%d%H%M%S)"
-        cp "$env_file" "$backup"
-        info "Existing .env backed up to: $backup"
+        # ── Upgrade path: file already exists ────────────────────────────────
+        log ".env already exists — preserving all existing values."
+        info "Checking for any missing keys and adding defaults..."
 
-        # Re-use secrets already in place to avoid invalidating sessions
-        local old_secret
-        old_secret=$(grep -Po '(?<=^SECRET_KEY=).+' "$env_file" 2>/dev/null || true)
-        [[ -n "$old_secret" ]] && SECRET_KEY="$old_secret" \
-            && info "Reusing existing SECRET_KEY."
-    fi
+        # Derive SECRET_KEY from file so generate logic below is consistent
+        SECRET_KEY=$(_env_get "SECRET_KEY")
+        [[ -n "$SECRET_KEY" ]] || \
+            SECRET_KEY=$("$python_bin" -c "import secrets; print(secrets.token_hex(32))")
 
-    # Generate any missing secrets
-    [[ -z "$SECRET_KEY"   ]] && \
-        SECRET_KEY=$("$python_bin" -c "import secrets; print(secrets.token_hex(32))")
-    [[ -z "$DB_PASSWORD"  ]] && \
-        DB_PASSWORD=$("$python_bin" -c "import secrets; print(secrets.token_urlsafe(32))")
+        # Build ALLOWED_HOSTS / CORS values if not already in file
+        local allowed_hosts='["*"]'
+        local cors_origins='[]'
+        if [[ -n "$PANEL_DOMAIN" ]]; then
+            allowed_hosts="[\"${PANEL_DOMAIN}\"]"
+            cors_origins="[\"https://${PANEL_DOMAIN}\"]"
+        fi
 
-    # Build ALLOWED_HOSTS / CORS_ORIGINS from the panel domain
-    local allowed_hosts='["*"]'
-    local cors_origins='[]'
-    if [[ -n "$PANEL_DOMAIN" ]]; then
-        allowed_hosts="[\"${PANEL_DOMAIN}\"]"
-        cors_origins="[\"https://${PANEL_DOMAIN}\"]"
-    fi
+        # Ensure every expected key is present — _env_ensure is a no-op
+        # if the key already exists, so this is always safe.
+        _env_ensure "APP_ENV"              "production"
+        _env_ensure "SECRET_KEY"           "$SECRET_KEY"
+        _env_ensure "ALLOWED_HOSTS"        "$allowed_hosts"
+        _env_ensure "CORS_ORIGINS"         "$cors_origins"
+        _env_ensure "DATABASE_URL"         "postgresql+asyncpg://securepanel:${DB_PASSWORD}@127.0.0.1:5432/securepanel"
+        _env_ensure "REDIS_URL"            "redis://127.0.0.1:6379/0"
+        _env_ensure "CELERY_BROKER_URL"    "redis://127.0.0.1:6379/1"
+        _env_ensure "CELERY_RESULT_BACKEND" "redis://127.0.0.1:6379/2"
+        _env_ensure "MAIL_DOMAIN"          "${PANEL_DOMAIN:-example.com}"
+        _env_ensure "PANEL_ADMIN_EMAIL"    "${ADMIN_EMAIL:-ssl-admin@localhost}"
+        _env_ensure "ANTHROPIC_API_KEY"    ""
+        _env_ensure "DB_ADMIN_PASSWORD"    ""
 
-    cat > "$env_file" << ENV
+        log ".env: all required keys present."
+    else
+        # ── Fresh install: write the full template ────────────────────────────
+        log "Writing .env (fresh install)..."
+
+        [[ -z "$SECRET_KEY"  ]] && \
+            SECRET_KEY=$("$python_bin" -c "import secrets; print(secrets.token_hex(32))")
+        [[ -z "$DB_PASSWORD" ]] && \
+            DB_PASSWORD=$("$python_bin" -c "import secrets; print(secrets.token_urlsafe(32))")
+
+        local allowed_hosts='["*"]'
+        local cors_origins='[]'
+        if [[ -n "$PANEL_DOMAIN" ]]; then
+            allowed_hosts="[\"${PANEL_DOMAIN}\"]"
+            cors_origins="[\"https://${PANEL_DOMAIN}\"]"
+        fi
+
+        cat > "$env_file" << ENV
 # ============================================================
 # Oosoft SecurePanel — Runtime Configuration
-# Generated by installer $(date -Iseconds)
+# Generated: $(date -Iseconds)
 # !! KEEP SECRET — contains credentials and signing keys !!
 # ============================================================
 
 APP_ENV=production
 
-# ── JWT signing key ─────────────────────────────────────────
-# WARNING: changing this after first start invalidates ALL
-# active user sessions. Rotate only when required.
+# ── JWT signing key ──────────────────────────────────────────
+# Changing this invalidates ALL active sessions. Rotate only
+# when absolutely required.
 SECRET_KEY=${SECRET_KEY}
 
-# ── Allowed hosts / CORS ────────────────────────────────────
+# ── Allowed hosts / CORS ─────────────────────────────────────
 ALLOWED_HOSTS=${allowed_hosts}
 CORS_ORIGINS=${cors_origins}
 
-# ── Database ────────────────────────────────────────────────
+# ── Database ─────────────────────────────────────────────────
 DATABASE_URL=postgresql+asyncpg://securepanel:${DB_PASSWORD}@127.0.0.1:5432/securepanel
 
-# ── Redis / Celery ──────────────────────────────────────────
+# ── Redis / Celery ───────────────────────────────────────────
 REDIS_URL=redis://127.0.0.1:6379/0
 CELERY_BROKER_URL=redis://127.0.0.1:6379/1
 CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/2
 
-# ── Mail ────────────────────────────────────────────────────
-# Set to the primary domain this server handles mail for.
+# ── Mail ─────────────────────────────────────────────────────
 MAIL_DOMAIN=${PANEL_DOMAIN:-example.com}
 
-# ── SSL / Certbot ───────────────────────────────────────────
-# Used as the --email argument to certbot for expiry notices.
+# ── SSL / Certbot ────────────────────────────────────────────
 PANEL_ADMIN_EMAIL=${ADMIN_EMAIL:-ssl-admin@localhost}
 
-# ── AI Assistant (optional) ─────────────────────────────────
-# Leave blank to disable. Get a key at console.anthropic.com
+# ── AI Assistant (optional) ──────────────────────────────────
 ANTHROPIC_API_KEY=
 
-# ── MySQL admin (for database management features) ──────────
-# Set this to the MySQL root password if MySQL is installed.
+# ── MySQL admin (for database-management features) ───────────
 DB_ADMIN_PASSWORD=
 ENV
+    fi
 
-    # Secure permissions: only root and the panel group can read
+    # Enforce strict permissions on every run
     chown "root:$PANEL_GROUP" "$env_file"
     chmod 640 "$env_file"
 
-    log ".env written: $env_file  (mode 640, root:${PANEL_GROUP})"
-    info "  SECRET_KEY:   generated (${#SECRET_KEY} chars)"
-    info "  DATABASE_URL: postgresql+asyncpg://securepanel:***@127.0.0.1:5432/securepanel"
-    info "  REDIS_URL:    redis://127.0.0.1:6379/0"
+    info "  $env_file  (mode 640, owner root:${PANEL_GROUP})"
 }
 
 # =============================================================================
 # DATABASE MIGRATIONS
+# alembic upgrade head is idempotent — no-op if schema is already current.
 # =============================================================================
 
 run_migrations() {
@@ -604,33 +710,37 @@ run_migrations() {
 
     local alembic_ini="${BACKEND_DIR}/alembic.ini"
     if [[ ! -f "$alembic_ini" ]]; then
-        warn "alembic.ini not found — skipping migrations."
-        info "Run manually:  cd $BACKEND_DIR && $VENV_DIR/bin/alembic upgrade head"
+        warn "alembic.ini not found — skipping."
+        info "Run: cd ${BACKEND_DIR} && ${VENV_DIR}/bin/alembic upgrade head"
         return 0
     fi
 
-    # Export DATABASE_URL from the .env so alembic can connect
     local db_url
-    db_url=$(grep -Po '(?<=^DATABASE_URL=).+' "${BACKEND_DIR}/.env" || true)
+    db_url=$(_env_get "DATABASE_URL")
     if [[ -z "$db_url" ]]; then
-        warn "DATABASE_URL not found in .env — skipping migrations."
+        warn "DATABASE_URL missing from .env — skipping migrations."
         return 0
     fi
 
-    log "Running:  alembic upgrade head"
+    log "alembic upgrade head..."
     (
         cd "$BACKEND_DIR"
         DATABASE_URL="$db_url" "$VENV_DIR/bin/alembic" upgrade head
     ) && log "Migrations: OK" \
-      || warn "Alembic reported an error. Run manually and check logs."
+      || warn "Alembic error — run manually and check logs."
 }
 
 # =============================================================================
 # SYSTEMD SERVICE UNITS
+#
+# Idempotency: compare source and destination with cmp before copying.
+# Copy only when content differs.  daemon-reload only if anything changed.
+# Services are restarted only when their unit file was updated.
 # =============================================================================
 
 install_systemd_services() {
     step "Installing systemd service units"
+    UNITS_CHANGED=0
 
     local services=(
         securepanel-agent
@@ -644,45 +754,61 @@ install_systemd_services() {
         local dst="/etc/systemd/system/${svc}.service"
 
         if [[ ! -f "$src" ]]; then
-            warn "  Service file not found: $src — skipping."
+            warn "  Unit file not found: $src — skipping."
             continue
         fi
 
-        cp "$src" "$dst"
+        # Prepare a patched copy in a temp file, then compare with destination
+        local tmp
+        tmp=$(mktemp)
+        cp "$src" "$tmp"
 
-        # Patch securepanel-agent: the service file shipped in the repo
-        # still references /etc/nginx/sites-enabled (Ubuntu-style path).
-        # The nginx handler code uses /etc/nginx/conf.d — fix it here.
         if [[ "$svc" == "securepanel-agent" ]]; then
-            sed -i "s|/etc/nginx/sites-enabled|${NGINX_CONF_D}|g" "$dst"
-            # Also add /var/www to ReadWritePaths so the agent can create webroots
-            sed -i "s|ReadWritePaths=|ReadWritePaths=/var/www |" "$dst"
-            info "  Patched agent ReadWritePaths: sites-enabled → conf.d, added /var/www"
+            sed -i "s|/etc/nginx/sites-enabled|${NGINX_CONF_D}|g" "$tmp"
+            sed -i "s|ReadWritePaths=|ReadWritePaths=/var/www |"   "$tmp"
         fi
 
-        chmod 644 "$dst"
-        info "  Installed: ${svc}.service"
+        if [[ -f "$dst" ]] && cmp -s "$tmp" "$dst"; then
+            skip "  ${svc}.service (unchanged)"
+        else
+            cp "$tmp" "$dst"
+            chmod 644 "$dst"
+            UNITS_CHANGED=1
+            info "  Installed: ${svc}.service"
+        fi
+        rm -f "$tmp"
     done
 
-    # certbot-renewal: create inline if not in repo
     _install_certbot_units
 
-    systemctl daemon-reload
-    log "systemd: daemon-reload complete."
+    if (( UNITS_CHANGED )); then
+        systemctl daemon-reload
+        log "systemd: daemon-reload complete (units changed)."
+    else
+        skip "systemd daemon-reload (no units changed)"
+    fi
 }
 
 _install_certbot_units() {
     local svc_src="${SYSTEMD_SRC}/certbot-renewal.service"
     local tmr_src="${SYSTEMD_SRC}/certbot-renewal.timer"
+    local svc_dst="/etc/systemd/system/certbot-renewal.service"
+    local tmr_dst="/etc/systemd/system/certbot-renewal.timer"
 
-    # Service
+    # Service unit
     if [[ -f "$svc_src" ]]; then
-        cp "$svc_src" /etc/systemd/system/certbot-renewal.service
-    else
-        cat > /etc/systemd/system/certbot-renewal.service << 'EOF'
+        if [[ -f "$svc_dst" ]] && cmp -s "$svc_src" "$svc_dst"; then
+            skip "  certbot-renewal.service (unchanged)"
+        else
+            cp "$svc_src" "$svc_dst"
+            chmod 644 "$svc_dst"
+            UNITS_CHANGED=1
+            info "  Installed: certbot-renewal.service"
+        fi
+    elif [[ ! -f "$svc_dst" ]]; then
+        cat > "$svc_dst" << 'EOF'
 [Unit]
 Description=Certbot Certificate Renewal
-Documentation=https://certbot.eff.org/docs/
 After=network-online.target
 Wants=network-online.target
 
@@ -691,22 +817,30 @@ Type=oneshot
 ExecStart=/usr/bin/certbot renew --quiet --no-random-sleep-on-renew
 PrivateTmp=yes
 EOF
-        info "  Created certbot-renewal.service (inline)."
-    fi
-    chmod 644 /etc/systemd/system/certbot-renewal.service
-
-    # Timer
-    if [[ -f "$tmr_src" ]]; then
-        cp "$tmr_src" /etc/systemd/system/certbot-renewal.timer
+        chmod 644 "$svc_dst"
+        UNITS_CHANGED=1
+        info "  Created: certbot-renewal.service (inline)"
     else
-        cat > /etc/systemd/system/certbot-renewal.timer << 'EOF'
+        skip "  certbot-renewal.service (already present)"
+    fi
+
+    # Timer unit
+    if [[ -f "$tmr_src" ]]; then
+        if [[ -f "$tmr_dst" ]] && cmp -s "$tmr_src" "$tmr_dst"; then
+            skip "  certbot-renewal.timer (unchanged)"
+        else
+            cp "$tmr_src" "$tmr_dst"
+            chmod 644 "$tmr_dst"
+            UNITS_CHANGED=1
+            info "  Installed: certbot-renewal.timer"
+        fi
+    elif [[ ! -f "$tmr_dst" ]]; then
+        cat > "$tmr_dst" << 'EOF'
 [Unit]
 Description=Twice-daily Let's Encrypt certificate renewal
-Documentation=https://certbot.eff.org/docs/
 After=network-online.target
 
 [Timer]
-# Run at a random time within ±1 hour of 04:00 and 16:00 each day.
 OnCalendar=*-*-* 04:00:00
 OnCalendar=*-*-* 16:00:00
 RandomizedDelaySec=3600
@@ -715,21 +849,27 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-        info "  Created certbot-renewal.timer (inline)."
+        chmod 644 "$tmr_dst"
+        UNITS_CHANGED=1
+        info "  Created: certbot-renewal.timer (inline)"
+    else
+        skip "  certbot-renewal.timer (already present)"
     fi
-    chmod 644 /etc/systemd/system/certbot-renewal.timer
-
-    info "  Installed: certbot-renewal.service + certbot-renewal.timer"
 }
 
 # =============================================================================
 # LOG ROTATION
+# Write only if the file does not yet exist or content has changed.
 # =============================================================================
 
 setup_logrotate() {
     step "Configuring log rotation"
 
-    cat > /etc/logrotate.d/securepanel << 'EOF'
+    local dest="/etc/logrotate.d/securepanel"
+    local tmp
+    tmp=$(mktemp)
+
+    cat > "$tmp" << 'EOF'
 /var/log/securepanel/*.log {
     daily
     rotate 90
@@ -740,53 +880,101 @@ setup_logrotate() {
     create 0640 securepanel securepanel
     sharedscripts
     postrotate
-        # Signal gunicorn to re-open log file handles after rotation.
         systemctl kill --signal=USR1 securepanel 2>/dev/null || true
     endscript
 }
 EOF
-    log "logrotate: daily, 90-day retention, compress — /var/log/securepanel/*.log"
+
+    if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
+        skip "logrotate config (unchanged)"
+    else
+        cp "$tmp" "$dest"
+        log "logrotate: daily, 90 days, compress — /var/log/securepanel/*.log"
+    fi
+    rm -f "$tmp"
 }
 
 # =============================================================================
-# NGINX CONFIGURATION (BOOTSTRAP)
+# NGINX CONFIGURATION
+#
+# Idempotency rules:
+#   1. If panel.conf already contains ssl_certificate directives, SSL is live —
+#      NEVER overwrite it with the HTTP bootstrap (would break HTTPS).
+#   2. If panel.conf already exists with the correct domain, leave it alone.
+#   3. On fresh install, or when FORCE_NGINX=1, deploy the bootstrap config.
 # =============================================================================
 
 setup_nginx() {
-    step "Configuring nginx (HTTP bootstrap)"
+    step "Configuring nginx"
 
-    local bootstrap_src="${INSTALL_DIR}/nginx/panel-bootstrap.conf"
     local panel_conf="${NGINX_CONF_D}/panel.conf"
+
+    if [[ -f "$panel_conf" ]]; then
+        # Guard: don't touch a live HTTPS config
+        if grep -q "ssl_certificate" "$panel_conf" 2>/dev/null; then
+            if [[ "$FORCE_NGINX" != "1" ]]; then
+                skip "nginx panel.conf (SSL config already active — use FORCE_NGINX=1 to override)"
+                # Ensure nginx is enabled and running even when skipping config write
+                systemctl enable nginx 2>/dev/null || true
+                systemctl is-active --quiet nginx || systemctl start nginx
+                return
+            else
+                warn "FORCE_NGINX=1 set — overwriting existing nginx config."
+            fi
+        fi
+
+        # If the domain hasn't changed and it's already a bootstrap config,
+        # skip the write to avoid an unnecessary reload.
+        if [[ -n "$PANEL_DOMAIN" ]] \
+           && grep -q "server_name.*${PANEL_DOMAIN}" "$panel_conf" 2>/dev/null \
+           && ! grep -q "ssl_certificate" "$panel_conf" 2>/dev/null; then
+            skip "nginx bootstrap config (domain already set to $PANEL_DOMAIN)"
+            systemctl enable nginx 2>/dev/null || true
+            systemctl is-active --quiet nginx || systemctl start nginx
+            return
+        fi
+    fi
+
+    # Write bootstrap config
+    local bootstrap_src="${INSTALL_DIR}/nginx/panel-bootstrap.conf"
+    local tmp
+    tmp=$(mktemp)
 
     if [[ -f "$bootstrap_src" ]]; then
         if [[ -n "$PANEL_DOMAIN" ]]; then
-            sed "s/panel\.example\.com/$PANEL_DOMAIN/g" "$bootstrap_src" \
-                > "$panel_conf"
+            sed "s/panel\.example\.com/$PANEL_DOMAIN/g" "$bootstrap_src" > "$tmp"
         else
-            cp "$bootstrap_src" "$panel_conf"
+            cp "$bootstrap_src" "$tmp"
         fi
     else
-        # Fallback: write minimal bootstrap inline
-        _write_nginx_bootstrap "$panel_conf"
+        _write_nginx_bootstrap_to "$tmp"
     fi
-    chmod 644 "$panel_conf"
 
-    # Validate and enable
+    # Only write if different from what's already on disk
+    if [[ -f "$panel_conf" ]] && cmp -s "$tmp" "$panel_conf"; then
+        skip "nginx panel.conf (content unchanged)"
+    else
+        cp "$tmp" "$panel_conf"
+        chmod 644 "$panel_conf"
+        log "nginx: bootstrap config written → $panel_conf"
+    fi
+    rm -f "$tmp"
+
     if nginx -t 2>/dev/null; then
         systemctl enable nginx
         systemctl restart nginx 2>/dev/null || systemctl start nginx
-        log "nginx: running  (bootstrap config active)."
+        log "nginx: running."
     else
-        warn "nginx -t failed — check $panel_conf. nginx not started."
-        nginx -t  # print the actual error
+        warn "nginx -t FAILED — check $panel_conf"
+        nginx -t   # print the actual errors
     fi
 }
 
-_write_nginx_bootstrap() {
+_write_nginx_bootstrap_to() {
     local dest="$1"
     local sn="${PANEL_DOMAIN:-_}"
     cat > "$dest" << NGINXEOF
-# Oosoft SecurePanel — HTTP Bootstrap
+# Oosoft SecurePanel — HTTP bootstrap config
 # Replace with HTTPS config after running ssl-setup.sh
 
 server {
@@ -794,14 +982,12 @@ server {
     listen      [::]:80 default_server;
     server_name ${sn};
 
-    # ACME challenge path (required for certbot to obtain the certificate)
     location /.well-known/acme-challenge/ {
         root         /var/www/letsencrypt;
         default_type "text/plain";
         try_files    \$uri =404;
     }
 
-    # Block all other requests until SSL is configured
     location / {
         return 503 "Panel configuration in progress.";
         add_header Content-Type "text/plain" always;
@@ -812,6 +998,8 @@ NGINXEOF
 
 # =============================================================================
 # FIREWALL
+# firewall-cmd --permanent --add-service is idempotent (no error if already set).
+# ufw allow is idempotent.
 # =============================================================================
 
 setup_firewall() {
@@ -824,78 +1012,69 @@ setup_firewall() {
 }
 
 _setup_firewall_firewalld() {
-    if ! command -v firewall-cmd &>/dev/null; then
-        warn "firewalld not found — skipping firewall setup."
-        return
-    fi
+    command -v firewall-cmd &>/dev/null \
+        || { warn "firewalld not found — skipping."; return; }
 
     systemctl enable --now firewalld
 
-    # Ensure SSH is not accidentally removed
-    firewall-cmd --permanent --add-service=ssh   --quiet 2>/dev/null || true
-    # Open HTTP and HTTPS for the panel and hosted sites
-    firewall-cmd --permanent --add-service=http  --quiet
-    firewall-cmd --permanent --add-service=https --quiet
-    # Remove Cockpit (often enabled by default on AlmaLinux, unnecessary here)
+    firewall-cmd --permanent --add-service=ssh    --quiet 2>/dev/null || true
+    firewall-cmd --permanent --add-service=http   --quiet
+    firewall-cmd --permanent --add-service=https  --quiet
     firewall-cmd --permanent --remove-service=cockpit --quiet 2>/dev/null || true
-
     firewall-cmd --reload --quiet
+
     log "firewalld: SSH(22) + HTTP(80) + HTTPS(443) open."
-    info "  Verify:  firewall-cmd --list-all"
 }
 
 _setup_firewall_ufw() {
-    if ! command -v ufw &>/dev/null; then
-        warn "ufw not found — skipping firewall setup."
-        return
-    fi
+    command -v ufw &>/dev/null \
+        || { warn "ufw not found — skipping."; return; }
 
-    # Allow SSH before enabling to prevent lockout
-    ufw allow OpenSSH  --force 2>/dev/null || ufw allow 22/tcp --force
+    ufw allow OpenSSH  --force 2>/dev/null || ufw allow 22/tcp  --force
     ufw allow 80/tcp   --force
     ufw allow 443/tcp  --force
     ufw --force enable
 
     log "ufw: SSH(22) + HTTP(80) + HTTPS(443) allowed."
-    info "  Verify:  ufw status verbose"
 }
 
 # =============================================================================
-# START SERVICES
+# START / RESTART SERVICES
+#
+# Idempotency notes:
+#   • systemctl enable   — idempotent (no-op if already enabled)
+#   • systemctl restart  — always restarts; intentional on upgrade
+#     (new code was deployed; services must pick it up)
+#   • On unit-file-unchanged upgrades where only Python deps changed,
+#     restart is still correct — workers load Python code at startup.
 # =============================================================================
 
 start_services() {
     step "Enabling and starting panel services"
 
-    # 1. Agent must start before the API (API checks for agent socket at startup)
+    # Agent first — API refuses to start without its socket
     systemctl enable securepanel-agent
-    if ! systemctl restart securepanel-agent; then
-        warn "securepanel-agent failed to start."
-        warn "Check:  journalctl -u securepanel-agent --no-pager -n 30"
-    fi
+    systemctl restart securepanel-agent \
+        || warn "securepanel-agent failed — check: journalctl -u securepanel-agent -n 30"
 
-    # Give the agent up to 8 s to create its Unix socket
+    # Wait for the agent socket (up to 10 s)
     local socket="${RUN_DIR}/agent.sock"
-    local retries=8
+    local retries=10
     while [[ ! -S "$socket" ]] && (( retries-- > 0 )); do sleep 1; done
-    if [[ -S "$socket" ]]; then
-        info "  Agent socket:  $socket  ✓"
-    else
-        warn "  Agent socket not visible yet — API will retry on start."
-    fi
+    [[ -S "$socket" ]] \
+        && info "  Agent socket: $socket  ✓" \
+        || warn "  Agent socket not visible yet — API will retry."
 
-    # 2. API + async workers
+    # API + workers
     for svc in securepanel securepanel-worker securepanel-beat; do
         systemctl enable "$svc"
-        if ! systemctl restart "$svc"; then
-            warn "$svc failed to start — check: journalctl -u $svc --no-pager -n 30"
-        fi
+        systemctl restart "$svc" \
+            || warn "$svc failed — check: journalctl -u $svc -n 30"
         local st
         st=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
         info "  ${svc}: $st"
     done
 
-    # 3. Certbot renewal timer
     systemctl enable --now certbot-renewal.timer 2>/dev/null || true
     info "  certbot-renewal.timer: enabled"
 
@@ -903,7 +1082,8 @@ start_services() {
 }
 
 # =============================================================================
-# SSL SETUP (OPTIONAL — runs only when PANEL_DOMAIN + ADMIN_EMAIL are set)
+# SSL — optional; only runs when PANEL_DOMAIN + ADMIN_EMAIL are set and
+# DNS already resolves. ssl-setup.sh is itself idempotent.
 # =============================================================================
 
 maybe_setup_ssl() {
@@ -911,39 +1091,38 @@ maybe_setup_ssl() {
 
     local ssl_script="${INSTALL_DIR}/scripts/ssl-setup.sh"
 
-    # Guard: need both domain and email
+    # Skip if cert already exists for this domain — ssl-setup.sh would no-op
+    # but we avoid the DNS check overhead and confusing output.
+    if [[ -n "$PANEL_DOMAIN" ]] \
+       && [[ -f "/etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem" ]]; then
+        skip "SSL (certificate already present for $PANEL_DOMAIN)"
+        return
+    fi
+
     if [[ -z "$PANEL_DOMAIN" ]] || [[ -z "$ADMIN_EMAIL" ]]; then
-        info "PANEL_DOMAIN or ADMIN_EMAIL not set — skipping automatic SSL."
-        info "Run ssl-setup.sh manually once DNS is configured:"
-        info "  PANEL_DOMAIN=panel.example.com \\"
-        info "  ADMIN_EMAIL=admin@example.com \\"
-        info "  bash ${ssl_script}"
+        info "PANEL_DOMAIN or ADMIN_EMAIL not set — skipping SSL."
+        info "Run manually:  PANEL_DOMAIN=... ADMIN_EMAIL=... bash ${ssl_script}"
         return
     fi
 
-    if [[ ! -f "$ssl_script" ]]; then
-        warn "ssl-setup.sh not found at $ssl_script — skipping SSL."
-        return
-    fi
+    [[ -f "$ssl_script" ]] || { warn "ssl-setup.sh not found — skipping."; return; }
 
-    # DNS check: abort early rather than burning a certbot rate-limit attempt
-    local resolved_ip
-    resolved_ip=$(getent hosts "$PANEL_DOMAIN" | awk '{print $1}' 2>/dev/null || true)
-    if [[ -z "$resolved_ip" ]]; then
+    local resolved
+    resolved=$(getent hosts "$PANEL_DOMAIN" | awk '{print $1}' 2>/dev/null || true)
+    if [[ -z "$resolved" ]]; then
         warn "DNS: $PANEL_DOMAIN does not resolve yet."
-        info "Point an A record here, then run ssl-setup.sh manually."
+        info "Point an A record here, then re-run this script or run ssl-setup.sh."
         return
     fi
-    log "DNS: $PANEL_DOMAIN → $resolved_ip"
+    log "DNS: $PANEL_DOMAIN → $resolved"
 
-    log "Launching ssl-setup.sh for $PANEL_DOMAIN ..."
     PANEL_DOMAIN="$PANEL_DOMAIN" \
-    ADMIN_EMAIL="$ADMIN_EMAIL" \
-    INSTALL_DIR="$INSTALL_DIR" \
-    PANEL_YES="$PANEL_YES" \
+    ADMIN_EMAIL="$ADMIN_EMAIL"   \
+    INSTALL_DIR="$INSTALL_DIR"   \
+    PANEL_YES="$PANEL_YES"       \
     bash "$ssl_script" \
         && log "SSL setup: OK" \
-        || warn "ssl-setup.sh encountered an error — check its output above."
+        || warn "ssl-setup.sh error — check output above."
 }
 
 # =============================================================================
@@ -951,21 +1130,28 @@ maybe_setup_ssl() {
 # =============================================================================
 
 print_banner() {
-    # Determine panel URL
     local proto="http"
     [[ -f "/etc/letsencrypt/live/${PANEL_DOMAIN:-}/fullchain.pem" ]] && proto="https"
     local panel_url="${proto}://${PANEL_DOMAIN:-$(hostname -I | awk '{print $1}')}"
+    local mode_label="Installation"
+    (( IS_UPGRADE )) && mode_label="Upgrade"
 
     echo
     echo -e "${GREEN}${BOLD}"
     echo "  ╔══════════════════════════════════════════════════════════════════╗"
     echo "  ║                                                                  ║"
-    echo "  ║      ✓  Oosoft SecurePanel — Installation Complete              ║"
+    echo "  ║      ✓  Oosoft SecurePanel — ${mode_label} Complete               ║"
     echo "  ║                                                                  ║"
     echo "  ╚══════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
-    # Access info
+    local mode_str
+    if (( IS_UPGRADE )); then
+        mode_str="Upgrade  (${PREV_VERSION} → ${INSTALLER_VERSION})"
+    else
+        mode_str="Fresh install  (${INSTALLER_VERSION})"
+    fi
+    echo -e "  ${CYAN}Mode:${NC}              ${mode_str}"
     echo -e "  ${CYAN}Panel URL:${NC}         ${BOLD}${panel_url}${NC}"
     echo -e "  ${CYAN}Install directory:${NC} $INSTALL_DIR"
     echo -e "  ${CYAN}Configuration:${NC}     ${BACKEND_DIR}/.env"
@@ -973,7 +1159,6 @@ print_banner() {
     echo -e "  ${CYAN}Install log:${NC}       $INSTALL_LOG"
     echo
 
-    # Service status table
     echo -e "  ${BOLD}Service status:${NC}"
     for svc in securepanel-agent securepanel securepanel-worker securepanel-beat; do
         local st
@@ -986,70 +1171,73 @@ print_banner() {
     done
     echo
 
-    # Pending tasks (SSL, configuration)
-    local needs_attention=0
-
-    if [[ -z "$PANEL_DOMAIN" ]] || \
-       [[ ! -f "/etc/letsencrypt/live/${PANEL_DOMAIN:-}/fullchain.pem" ]]; then
-        (( needs_attention++ ))
-        echo -e "  ${YELLOW}${BOLD}Action required — SSL not yet configured:${NC}"
-        echo
-        echo    "    1. Edit the configuration file and fill in any remaining values:"
+    if [[ -z "$PANEL_DOMAIN" ]] \
+       || [[ ! -f "/etc/letsencrypt/live/${PANEL_DOMAIN:-}/fullchain.pem" ]]; then
+        echo -e "  ${YELLOW}${BOLD}Next steps:${NC}"
+        echo    "    1. Complete configuration (if needed):"
         echo    "         nano ${BACKEND_DIR}/.env"
-        echo
-        echo    "    2. Point your DNS A record for your panel domain to this server's IP."
-        echo
-        echo    "    3. Run ssl-setup.sh to obtain a Let's Encrypt certificate:"
+        echo    "    2. Point DNS A record to this server's IP."
+        echo    "    3. Run SSL setup once DNS propagates:"
         echo    "         PANEL_DOMAIN=panel.example.com \\"
         echo    "         ADMIN_EMAIL=admin@example.com \\"
         echo    "         bash ${INSTALL_DIR}/scripts/ssl-setup.sh"
-        echo
-        echo    "    4. After .env changes, restart panel services:"
-        echo    "         systemctl restart securepanel securepanel-worker securepanel-beat"
+        echo    "    4. Apply post-install hardening:"
+        echo    "         bash ${INSTALL_DIR}/scripts/hardening.sh"
         echo
     fi
 
     echo -e "  ${BOLD}Useful commands:${NC}"
-    echo    "    journalctl -u securepanel        -f    # API logs (live)"
-    echo    "    journalctl -u securepanel-agent  -f    # Agent logs (live)"
-    echo    "    journalctl -u securepanel-worker -f    # Worker logs (live)"
-    echo    "    systemctl  status  securepanel         # Service status"
-    echo    "    bash ${INSTALL_DIR}/scripts/hardening.sh  # Post-install hardening"
+    echo    "    journalctl -u securepanel       -f   # API logs"
+    echo    "    journalctl -u securepanel-agent -f   # Agent logs"
+    echo    "    systemctl status securepanel         # Service overview"
     echo
-    echo -e "  ${DIM}Install log saved to: $INSTALL_LOG${NC}"
+    echo -e "  ${DIM}Full install log: $INSTALL_LOG${NC}"
     echo
 }
 
 # =============================================================================
-# ENTRY POINT
+# MAIN
 # =============================================================================
 
 main() {
-    # ── Header ────────────────────────────────────────────────────────────────
+    # Header
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════════════════════════════╗"
     echo "  ║     Oosoft SecurePanel — Production Installer v${INSTALLER_VERSION}            ║"
     echo "  ║     $(date '+%Y-%m-%d  %H:%M:%S  %Z')                              ║"
     echo "  ╚══════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-    echo -e "  ${DIM}Full log:  $INSTALL_LOG${NC}"
+    echo -e "  ${DIM}Log: $INSTALL_LOG${NC}"
     echo
 
-    # ── Preflight ─────────────────────────────────────────────────────────────
+    # Preflight
     check_root
     detect_os
     check_resources
 
-    if [[ "$PANEL_YES" != "1" ]] && [[ -t 1 ]]; then
-        echo -e "  This will install Oosoft SecurePanel on ${BOLD}$(hostname -f)${NC}."
-        if [[ -n "$PANEL_DOMAIN" ]]; then
-            echo -e "  Panel domain:  ${BOLD}$PANEL_DOMAIN${NC}"
-        fi
-        confirm "  Proceed with installation?" \
-            || die "Installation cancelled."
+    # Detect existing installation
+    _read_state
+    if [[ -n "$PREV_VERSION" ]]; then
+        IS_UPGRADE=1
+        echo -e "  ${YELLOW}${BOLD}Upgrade mode${NC} — existing installation v${PREV_VERSION} detected."
+    else
+        echo -e "  ${GREEN}${BOLD}Fresh install${NC} — no existing installation found."
     fi
 
-    # ── Install steps ─────────────────────────────────────────────────────────
+    if [[ -n "$PANEL_DOMAIN" ]]; then
+        echo -e "  Panel domain:  ${BOLD}$PANEL_DOMAIN${NC}"
+    fi
+    echo
+
+    # Confirmation prompt
+    if [[ "$PANEL_YES" != "1" ]] && [[ -t 1 ]]; then
+        local action="Install"
+        (( IS_UPGRADE )) && action="Upgrade"
+        confirm "  ${action} Oosoft SecurePanel on $(hostname -f)?" \
+            || die "Cancelled."
+    fi
+
+    # Execute steps
     install_packages
     setup_users
     setup_directories
@@ -1066,7 +1254,9 @@ main() {
     start_services
     maybe_setup_ssl
 
-    # ── Done ──────────────────────────────────────────────────────────────────
+    # Persist state for future runs
+    _write_state
+
     print_banner
 }
 
