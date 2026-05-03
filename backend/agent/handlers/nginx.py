@@ -30,6 +30,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import socket
 from pathlib import Path
 from string import Template
@@ -145,6 +146,44 @@ server {
 }
 """
 
+_INLINE_TEMPLATE_SUSPENDED_HTTP = """\
+# /etc/nginx/conf.d/$domain.conf  —  SUSPENDED (Oosoft SecurePanel)
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name $domain www.$domain;
+
+    # Keep ACME challenge open so Let's Encrypt renewals succeed while suspended.
+    location /.well-known/acme-challenge/ {
+        root         /var/www/letsencrypt;
+        default_type "text/plain";
+        try_files    $$uri =404;
+    }
+
+    location / { return 503; }
+}
+"""
+
+# Appended to the HTTP stub when a cert already exists for the domain.
+# Prevents HSTS-preloaded browsers from seeing a certificate error.
+_INLINE_TEMPLATE_SUSPENDED_SSL = """\
+
+server {
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    http2       on;
+    server_name $domain;
+
+    ssl_certificate         /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key     /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/$domain/chain.pem;
+
+    include /etc/nginx/snippets/ssl-params.conf;
+
+    location / { return 503; }
+}
+"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Validation helpers (defense-in-depth — validator already checked these)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,6 +229,22 @@ def _safe_webroot_path(domain: str) -> Path:
     return path
 
 
+def _safe_disabled_vhost_path(domain: str) -> Path:
+    """Return the path to a domain's preserved (suspended) vhost config."""
+    path = (VHOST_DIR / f"{domain}.conf.disabled").resolve()
+    if not str(path).startswith(str(VHOST_DIR.resolve()) + "/"):
+        raise ValueError("Path traversal detected in disabled-vhost path construction")
+    return path
+
+
+def _safe_backup_vhost_path(domain: str) -> Path:
+    """Return a temporary backup path used by rebuild_domain for rollback."""
+    path = (VHOST_DIR / f"{domain}.conf.bak").resolve()
+    if not str(path).startswith(str(VHOST_DIR.resolve()) + "/"):
+        raise ValueError("Path traversal detected in backup-vhost path construction")
+    return path
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Config rendering
 # ─────────────────────────────────────────────────────────────────────────────
@@ -223,6 +278,29 @@ def _render_https_config(domain: str) -> str:
         except Exception as exc:
             logger.warning("Jinja2 HTTPS render failed (%s); using inline fallback", exc)
     return Template(_INLINE_TEMPLATE_HTTPS).safe_substitute(domain=domain)
+
+
+def _cert_exists(domain: str) -> bool:
+    """Return True if a complete Let's Encrypt cert set exists for *domain*."""
+    cert_dir = _LE_LIVE_DIR / domain
+    return all(
+        (cert_dir / fname).exists()
+        for fname in ("fullchain.pem", "privkey.pem", "chain.pem")
+    )
+
+
+def _render_suspended_config(domain: str) -> str:
+    """
+    Render a 503-returning suspension stub.
+
+    Always includes the HTTP block so ACME renewals survive suspension.
+    Appends a HTTPS 503 block when a cert already exists, preventing
+    HSTS-preloaded browsers from seeing a certificate error.
+    """
+    config = Template(_INLINE_TEMPLATE_SUSPENDED_HTTP).safe_substitute(domain=domain)
+    if _cert_exists(domain):
+        config += Template(_INLINE_TEMPLATE_SUSPENDED_SSL).safe_substitute(domain=domain)
+    return config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -491,22 +569,36 @@ async def create_domain(params: dict) -> dict:
 
 
 async def delete_domain(params: dict) -> dict:
-    """Remove a domain's nginx config; remove webroot only if empty."""
+    """
+    Remove a domain's nginx config(s) and webroot entirely.
+
+    Handles both active and suspended states:
+    - Removes {domain}.conf  (active config or suspension stub)
+    - Removes {domain}.conf.disabled  (preserved config from suspend)
+    - Removes /var/www/{domain}  (recursive, symlink-safe)
+    """
     domain         = params["domain"]
     linux_username = params["linux_username"]
 
     _assert_safe_domain(domain)
     _assert_safe_username(linux_username)
 
-    vhost_path = _safe_vhost_path(domain)
-    webroot    = _safe_webroot_path(domain)
+    vhost_path    = _safe_vhost_path(domain)
+    disabled_path = _safe_disabled_vhost_path(domain)
+    webroot       = _safe_webroot_path(domain)
 
-    config_removed = webroot_removed = False
+    config_removed = False
 
+    # Remove active config (present whether domain is live or suspended)
     if vhost_path.exists():
         vhost_path.unlink()
         config_removed = True
         logger.info("Removed nginx config: %s", vhost_path)
+
+    # Remove preserved config left by suspend_domain
+    if disabled_path.exists():
+        disabled_path.unlink()
+        logger.info("Removed suspended nginx config: %s", disabled_path)
 
     if config_removed:
         try:
@@ -516,16 +608,222 @@ async def delete_domain(params: dict) -> dict:
             logger.error("Nginx reload failed after delete domain=%s: %s", domain, exc)
             raise
 
-    if webroot.exists() and not any(webroot.iterdir()):
-        webroot.rmdir()
+    # Remove webroot — recursive, guards against symlink escape
+    webroot_removed = False
+    if webroot.is_symlink():
+        webroot.unlink()
         webroot_removed = True
-        logger.info("Removed empty webroot: %s", webroot)
+        logger.info("Removed webroot symlink: %s", webroot)
+    elif webroot.exists():
+        shutil.rmtree(str(webroot))
+        webroot_removed = True
+        logger.info("Removed webroot directory: %s", webroot)
 
     return {
         "domain":          domain,
         "linux_username":  linux_username,
         "config_removed":  config_removed,
         "webroot_removed": webroot_removed,
+    }
+
+
+async def suspend_domain(params: dict) -> dict:
+    """
+    Suspend a domain by swapping its nginx config for a 503 stub.
+
+    The original config is preserved as {domain}.conf.disabled so it can be
+    restored verbatim by unsuspend_domain, or replaced by rebuild_domain.
+
+    The ACME challenge location remains open so Let's Encrypt renewals
+    continue while the domain is suspended.  A HTTPS 503 block is also
+    written when a cert exists, preventing HSTS-preloaded clients from
+    encountering a certificate error.
+
+    Rollback: if ``nginx -t`` rejects the stub, the original config is
+    restored and no reload is performed.
+    """
+    domain         = params["domain"]
+    linux_username = params["linux_username"]
+
+    _assert_safe_domain(domain)
+    _assert_safe_username(linux_username)
+
+    vhost_path    = _safe_vhost_path(domain)
+    disabled_path = _safe_disabled_vhost_path(domain)
+
+    if not vhost_path.exists():
+        if disabled_path.exists():
+            raise RuntimeError(f"Domain {domain!r} is already suspended")
+        raise RuntimeError(f"No nginx config found for domain {domain!r}")
+
+    # Atomically preserve the active config before writing the stub.
+    vhost_path.rename(disabled_path)
+    logger.info("Preserved active config as: %s", disabled_path)
+
+    stub = _render_suspended_config(domain)
+    vhost_path.write_text(stub, encoding="utf-8")
+    vhost_path.chmod(0o644)
+
+    try:
+        await _nginx_test()
+    except RuntimeError as exc:
+        # Rollback: remove the bad stub and restore the original config.
+        vhost_path.unlink(missing_ok=True)
+        disabled_path.rename(vhost_path)
+        logger.error(
+            "Suspension nginx test failed for domain=%s — rolled back: %s",
+            domain, exc,
+        )
+        raise
+
+    await _nginx_reload()
+    logger.info("Domain suspended (503): domain=%s", domain)
+
+    return {"domain": domain, "suspended": True}
+
+
+async def unsuspend_domain(params: dict) -> dict:
+    """
+    Restore a suspended domain by reinstating its preserved nginx config.
+
+    Reads {domain}.conf.disabled (written by suspend_domain), renames it
+    back to {domain}.conf, and reloads nginx.  Rolls back if ``nginx -t``
+    rejects the restored config.
+    """
+    domain         = params["domain"]
+    linux_username = params["linux_username"]
+
+    _assert_safe_domain(domain)
+    _assert_safe_username(linux_username)
+
+    vhost_path    = _safe_vhost_path(domain)
+    disabled_path = _safe_disabled_vhost_path(domain)
+
+    if not disabled_path.exists():
+        raise RuntimeError(f"No suspended config found for domain {domain!r}")
+
+    # Rename .disabled → .conf, atomically replacing the 503 stub.
+    disabled_path.rename(vhost_path)
+    logger.info("Restored config from: %s → %s", disabled_path, vhost_path)
+
+    try:
+        await _nginx_test()
+    except RuntimeError as exc:
+        # Rollback: rename .conf back to .disabled so domain stays suspended.
+        vhost_path.rename(disabled_path)
+        logger.error(
+            "Unsuspend nginx test failed for domain=%s — rolled back: %s",
+            domain, exc,
+        )
+        raise
+
+    await _nginx_reload()
+    logger.info("Domain unsuspended: domain=%s", domain)
+
+    return {"domain": domain, "suspended": False}
+
+
+async def rebuild_domain(params: dict) -> dict:
+    """
+    Regenerate a domain's nginx config from current state.
+
+    SSL is detected from cert file existence (not from the database) so
+    the result is always consistent with what is on disk.
+
+    Suspended domains
+    ─────────────────
+    When the domain is suspended ({domain}.conf.disabled exists and
+    {domain}.conf is the 503 stub), the rebuilt config is written only to
+    the .disabled file.  The live 503 stub is left untouched and no reload
+    is performed.  The domain will serve the updated config next time
+    unsuspend_domain is called.
+
+    Active domains
+    ──────────────
+    1. Back up the current config to {domain}.conf.bak.
+    2. Write the new config.
+    3. Run ``nginx -t``:
+       - On failure: restore the backup and re-test/reload; raise.
+       - On success: reload nginx; remove the backup.
+    """
+    domain         = params["domain"]
+    linux_username = params["linux_username"]
+
+    _assert_safe_domain(domain)
+    _assert_safe_username(linux_username)
+
+    vhost_path    = _safe_vhost_path(domain)
+    disabled_path = _safe_disabled_vhost_path(domain)
+    backup_path   = _safe_backup_vhost_path(domain)
+
+    # A domain is considered suspended when the .disabled file exists AND
+    # the active .conf file is present (it holds the 503 stub).  If only
+    # .disabled exists and .conf is absent the state is inconsistent; we
+    # still treat it as suspended to avoid an accidental live reload.
+    is_suspended = disabled_path.exists()
+
+    ssl_active = _cert_exists(domain)
+    new_config  = _render_https_config(domain) if ssl_active else _render_config(domain)
+
+    if is_suspended:
+        # Overwrite the preserved config; leave the live 503 stub alone.
+        disabled_path.write_text(new_config, encoding="utf-8")
+        disabled_path.chmod(0o644)
+        logger.info(
+            "Rebuilt suspended config (not reloaded): domain=%s ssl=%s",
+            domain, ssl_active,
+        )
+        return {
+            "domain":        domain,
+            "ssl_active":    ssl_active,
+            "reloaded":      False,
+            "was_suspended": True,
+        }
+
+    # Active domain — backup → write → test → reload (restore on failure).
+    backup_written = False
+    if vhost_path.exists():
+        shutil.copy2(str(vhost_path), str(backup_path))
+        backup_written = True
+
+    vhost_path.write_text(new_config, encoding="utf-8")
+    vhost_path.chmod(0o644)
+
+    try:
+        await _nginx_test()
+    except RuntimeError as exc:
+        if backup_written and backup_path.exists():
+            shutil.copy2(str(backup_path), str(vhost_path))
+            logger.error(
+                "Rebuild nginx test failed for domain=%s — restored backup: %s",
+                domain, exc,
+            )
+            try:
+                await _nginx_test()
+                await _nginx_reload()
+            except RuntimeError:
+                logger.critical(
+                    "Backup config also failed nginx test for domain=%s — "
+                    "manual intervention required!",
+                    domain,
+                )
+        else:
+            logger.error(
+                "Rebuild nginx test failed for domain=%s (no backup): %s",
+                domain, exc,
+            )
+        raise
+    finally:
+        backup_path.unlink(missing_ok=True)
+
+    await _nginx_reload()
+    logger.info("Rebuilt domain config: domain=%s ssl=%s", domain, ssl_active)
+
+    return {
+        "domain":        domain,
+        "ssl_active":    ssl_active,
+        "reloaded":      True,
+        "was_suspended": False,
     }
 
 

@@ -61,6 +61,30 @@ ALLOWED_ACTIONS: dict[str, dict] = {
         },
         "strict_params": True,
     },
+    "nginx.suspend_domain": {
+        "params": ["domain", "linux_username"],
+        "validators": {
+            "domain":         _RE_DOMAIN,
+            "linux_username": _RE_LINUX_USERNAME,
+        },
+        "strict_params": True,
+    },
+    "nginx.unsuspend_domain": {
+        "params": ["domain", "linux_username"],
+        "validators": {
+            "domain":         _RE_DOMAIN,
+            "linux_username": _RE_LINUX_USERNAME,
+        },
+        "strict_params": True,
+    },
+    "nginx.rebuild_domain": {
+        "params": ["domain", "linux_username"],
+        "validators": {
+            "domain":         _RE_DOMAIN,
+            "linux_username": _RE_LINUX_USERNAME,
+        },
+        "strict_params": True,
+    },
 
     # ── Nginx config management (PHP/CMS flow) ────────────────────────────────
     "nginx.reload": {
@@ -199,6 +223,10 @@ class CommandValidator:
             # ── Domain provisioning ───────────────────────────────────────────
             "nginx.create_domain":       nginx.create_domain,
             "nginx.delete_domain":       nginx.delete_domain,
+            # ── Domain lifecycle ──────────────────────────────────────────────
+            "nginx.suspend_domain":      nginx.suspend_domain,
+            "nginx.unsuspend_domain":    nginx.unsuspend_domain,
+            "nginx.rebuild_domain":      nginx.rebuild_domain,
             # ── Nginx config management ───────────────────────────────────────
             "nginx.reload":              nginx.reload,
             "nginx.write_vhost":         nginx.write_vhost,

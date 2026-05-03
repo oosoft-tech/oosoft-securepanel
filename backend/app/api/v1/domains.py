@@ -61,6 +61,7 @@ class DomainResponse(BaseModel):
     php_version:    str
     ssl_enabled:    bool
     document_root:  str
+    status:         str          # "active" | "suspended"
 
     model_config = {"from_attributes": True}
 
@@ -292,6 +293,186 @@ async def delete_domain(
         "Domain deleted: domain=%r linux_username=%r user=%r",
         domain_obj.domain, linux_username, current_user.username,
     )
+
+
+@router.post("/{domain_id}/suspend", status_code=status.HTTP_200_OK)
+async def suspend_domain(
+    domain_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Suspend a domain.
+
+    Replaces the domain's nginx config with a 503 stub so the domain stops
+    serving content.  The original config is preserved on disk so it can be
+    restored by the unsuspend endpoint.  ACME challenge paths remain open so
+    Let's Encrypt certificate renewals continue during suspension.
+    """
+    result = await db.execute(
+        select(Domain).where(
+            Domain.id == domain_id,
+            Domain.user_id == current_user.id,
+        )
+    )
+    domain_obj = result.scalar_one_or_none()
+    if not domain_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Domain not found"
+        )
+
+    if domain_obj.status == "suspended":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Domain is already suspended"
+        )
+
+    linux_username = domain_obj.linux_username
+    if not linux_username:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cannot suspend a legacy domain without a system username.",
+        )
+
+    agent = AgentClient()
+    try:
+        await agent.call("nginx.suspend_domain", {
+            "domain":         domain_obj.domain,
+            "linux_username": linux_username,
+        })
+    except (AgentError, RuntimeError, TimeoutError) as exc:
+        raise _agent_http_error(exc, f"suspend_domain({domain_obj.domain!r})")
+
+    domain_obj.status = "suspended"
+    await db.commit()
+    await db.refresh(domain_obj)
+
+    logger.info(
+        "Domain suspended: domain=%r user=%r",
+        domain_obj.domain, current_user.username,
+    )
+    return DomainResponse.model_validate(domain_obj)
+
+
+@router.post("/{domain_id}/unsuspend", status_code=status.HTTP_200_OK)
+async def unsuspend_domain(
+    domain_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Unsuspend a previously suspended domain.
+
+    Restores the preserved nginx config and reloads nginx so the domain
+    resumes serving content.
+    """
+    result = await db.execute(
+        select(Domain).where(
+            Domain.id == domain_id,
+            Domain.user_id == current_user.id,
+        )
+    )
+    domain_obj = result.scalar_one_or_none()
+    if not domain_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Domain not found"
+        )
+
+    if domain_obj.status != "suspended":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Domain is not suspended"
+        )
+
+    linux_username = domain_obj.linux_username
+    if not linux_username:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cannot unsuspend a legacy domain without a system username.",
+        )
+
+    agent = AgentClient()
+    try:
+        await agent.call("nginx.unsuspend_domain", {
+            "domain":         domain_obj.domain,
+            "linux_username": linux_username,
+        })
+    except (AgentError, RuntimeError, TimeoutError) as exc:
+        raise _agent_http_error(exc, f"unsuspend_domain({domain_obj.domain!r})")
+
+    domain_obj.status = "active"
+    await db.commit()
+    await db.refresh(domain_obj)
+
+    logger.info(
+        "Domain unsuspended: domain=%r user=%r",
+        domain_obj.domain, current_user.username,
+    )
+    return DomainResponse.model_validate(domain_obj)
+
+
+@router.post("/{domain_id}/rebuild", status_code=status.HTTP_200_OK)
+async def rebuild_domain(
+    domain_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Rebuild a domain's nginx config from current server state.
+
+    SSL status is detected from on-disk certificate files — not from the
+    database — so the result is always consistent.
+
+    If the domain is currently suspended the rebuilt config is written to the
+    preserved .disabled file only; the live 503 stub is left untouched and
+    the domain status remains "suspended".  The updated config will become
+    active on the next unsuspend call.
+    """
+    result = await db.execute(
+        select(Domain).where(
+            Domain.id == domain_id,
+            Domain.user_id == current_user.id,
+        )
+    )
+    domain_obj = result.scalar_one_or_none()
+    if not domain_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Domain not found"
+        )
+
+    linux_username = domain_obj.linux_username
+    if not linux_username:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cannot rebuild a legacy domain without a system username.",
+        )
+
+    agent = AgentClient()
+    try:
+        agent_result = await agent.call("nginx.rebuild_domain", {
+            "domain":         domain_obj.domain,
+            "linux_username": linux_username,
+        })
+    except (AgentError, RuntimeError, TimeoutError) as exc:
+        raise _agent_http_error(exc, f"rebuild_domain({domain_obj.domain!r})")
+
+    # Sync ssl_enabled with what the agent detected on disk.
+    ssl_active = agent_result.get("ssl_active", domain_obj.ssl_enabled)
+    if domain_obj.ssl_enabled != ssl_active:
+        domain_obj.ssl_enabled = ssl_active
+        await db.commit()
+        await db.refresh(domain_obj)
+
+    logger.info(
+        "Domain rebuilt: domain=%r user=%r ssl=%s reloaded=%s",
+        domain_obj.domain, current_user.username,
+        agent_result.get("ssl_active"), agent_result.get("reloaded"),
+    )
+    return {
+        "detail":        "Domain config rebuilt",
+        "domain":        domain_obj.domain,
+        "ssl_enabled":   ssl_active,
+        "reloaded":      agent_result.get("reloaded", False),
+        "was_suspended": agent_result.get("was_suspended", False),
+    }
 
 
 @router.post("/{domain_id}/ssl", status_code=status.HTTP_200_OK)

@@ -34,6 +34,10 @@ class Domain(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Lifecycle status: "active" | "suspended"
+    # Stored as a short string so future states (e.g. "pending", "deleted") are easy to add.
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+
     is_parked: Mapped[bool] = mapped_column(Boolean, default=False)
     parent_domain_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("domains.id"), nullable=True
