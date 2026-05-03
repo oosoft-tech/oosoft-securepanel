@@ -15,7 +15,7 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_SETUID CAP_SETGI
 NoNewPrivileges=no
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/run/securepanel /var/log/securepanel /etc/nginx/sites-enabled /etc/php-fpm.d /home /etc/dovecot /etc/postfix /etc/opendkim
+ReadWritePaths=/run/securepanel /var/log/securepanel /etc/nginx/conf.d /etc/nginx/snippets /var/www /etc/php-fpm.d /home /etc/dovecot /etc/postfix /etc/opendkim
 
 StandardOutput=append:/var/log/securepanel/agent.log
 StandardError=append:/var/log/securepanel/agent.log
