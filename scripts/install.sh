@@ -160,40 +160,190 @@ EOF
 }
 
 # =============================================================================
-# OS DETECTION
+# OS DETECTION AND STRICT VALIDATION
+#
+# Single source of truth for supported platforms.
+# Any OS / version / architecture not in SUPPORTED_PLATFORMS causes an
+# immediate exit with a clear, actionable error message.
 # =============================================================================
 
-detect_os() {
-    step "Detecting operating system"
+# Each entry: "os_id:version_prefix:os_family:os_codename"
+#   os_id          — value of ID from /etc/os-release (lowercase)
+#   version_prefix — prefix-matched against VERSION_ID (e.g. "8" matches "8.9")
+#   os_family      — "rhel" or "debian"  (controls package manager branch)
+#   os_codename    — internal token used throughout the script
+readonly -a SUPPORTED_PLATFORMS=(
+    "almalinux:8:rhel:al8"
+    "almalinux:9:rhel:al9"
+    "ubuntu:22.04:debian:jammy"
+)
 
-    [[ -f /etc/os-release ]] || die "/etc/os-release not found."
+# Human-readable list — printed in every OS error message.
+_os_supported_list() {
+    echo "    • AlmaLinux 8  (8.x)"
+    echo "    • AlmaLinux 9  (9.x)"
+    echo "    • Ubuntu 22.04 LTS  (Jammy Jellyfish)"
+}
+
+# Full-width error banner printed on any validation failure, then exits 1.
+# Args: $1 = detected pretty name, $2 = os_id, $3 = os_ver, $4 = arch,
+#       $5 = optional suggestion string
+_os_die() {
+    local pretty="$1" os_id="$2" os_ver="${3:-<unknown>}"
+    local arch="$4"   suggestion="${5:-}"
+
+    # Flush stdout before writing to stderr so log lines appear in order
+    echo | tee -a "$INSTALL_LOG" >/dev/null
+
+    {
+        echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}${BOLD}║                                                                  ║${NC}"
+        echo -e "${RED}${BOLD}║         ✗  UNSUPPORTED OPERATING SYSTEM                          ║${NC}"
+        echo -e "${RED}${BOLD}║                                                                  ║${NC}"
+        echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+        echo
+        echo -e "  ${BOLD}Detected:${NC}"
+        echo    "    OS:           ${pretty}"
+        echo    "    ID:           ${os_id}"
+        echo    "    Version:      ${os_ver}"
+        echo    "    Architecture: ${arch}"
+        echo
+        echo -e "  ${BOLD}Supported platforms:${NC}"
+        _os_supported_list
+        if [[ -n "$suggestion" ]]; then
+            echo
+            echo -e "  ${YELLOW}${BOLD}Suggestion:${NC}"
+            # Print each suggestion line indented
+            while IFS= read -r line; do
+                echo "    ${line}"
+            done <<< "$suggestion"
+        fi
+        echo
+        echo -e "  ${DIM}Provision a supported server and re-run:${NC}"
+        echo -e "  ${DIM}    curl -sSL https://oosoft.co.in/install.sh | bash${NC}"
+        echo
+    } | tee -a "$INSTALL_LOG" >&2
+
+    exit 1
+}
+
+detect_os() {
+    step "Validating operating system"
+
+    # ── 1. /etc/os-release must exist ────────────────────────────────────────
+    if [[ ! -f /etc/os-release ]]; then
+        {
+            echo -e "${RED}${BOLD}ERROR:${NC} /etc/os-release not found."
+            echo    "  Cannot identify the operating system."
+            echo    "  Supported platforms:"
+            _os_supported_list
+        } | tee -a "$INSTALL_LOG" >&2
+        exit 1
+    fi
+
+    # ── 2. Source and validate required fields ────────────────────────────────
     # shellcheck source=/dev/null
     source /etc/os-release
 
-    local id="${ID:-unknown}" ver="${VERSION_ID:-0}"
+    local os_id="${ID:-}"
+    local os_ver="${VERSION_ID:-}"
+    local os_pretty="${PRETTY_NAME:-${os_id} ${os_ver}}"
 
-    case "$id" in
-        almalinux|alma)
-            OS_FAMILY="rhel"
-            case "${ver%%.*}" in
-                8) OS_CODENAME="al8" ;;
-                9) OS_CODENAME="al9" ;;
-                *) die "AlmaLinux ${ver} not supported. Supported: 8, 9." ;;
-            esac
-            ;;
-        ubuntu)
-            OS_FAMILY="debian"
-            case "$ver" in
-                22.04) OS_CODENAME="jammy" ;;
-                *)     die "Ubuntu ${ver} not supported. Supported: 22.04." ;;
-            esac
-            ;;
-        *)
-            die "OS '${id}' not supported. Supported: AlmaLinux 8/9, Ubuntu 22.04."
-            ;;
-    esac
+    if [[ -z "$os_id" ]]; then
+        echo -e "${RED}ERROR:${NC} /etc/os-release is missing the 'ID' field." \
+            | tee -a "$INSTALL_LOG" >&2
+        exit 1
+    fi
+    if [[ -z "$os_ver" ]]; then
+        echo -e "${RED}ERROR:${NC} /etc/os-release is missing the 'VERSION_ID' field." \
+            | tee -a "$INSTALL_LOG" >&2
+        exit 1
+    fi
 
-    log "OS: ${PRETTY_NAME:-${id} ${ver}}  (family=${OS_FAMILY}, codename=${OS_CODENAME})"
+    # ── 3. Architecture: x86_64 only ─────────────────────────────────────────
+    local arch
+    arch=$(uname -m 2>/dev/null || echo "unknown")
+    if [[ "$arch" != "x86_64" ]]; then
+        {
+            echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${RED}${BOLD}║         ✗  UNSUPPORTED ARCHITECTURE                              ║${NC}"
+            echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+            echo
+            echo    "  Detected:  ${arch}"
+            echo    "  Required:  x86_64  (64-bit Intel / AMD)"
+            echo
+            echo    "  ARM, i686, and other architectures are not supported."
+            echo
+        } | tee -a "$INSTALL_LOG" >&2
+        exit 1
+    fi
+
+    # ── 4. Normalise ID to lowercase ──────────────────────────────────────────
+    os_id="${os_id,,}"
+
+    # ── 5. Match against strict allowlist ────────────────────────────────────
+    local matched=0
+    for platform in "${SUPPORTED_PLATFORMS[@]}"; do
+        IFS=':' read -r p_id p_ver_prefix p_family p_codename <<< "$platform"
+
+        # ID match: "almalinux" also matches the rare alias "alma"
+        local id_ok=0
+        [[ "$os_id" == "$p_id"                          ]] && id_ok=1
+        [[ "$p_id"  == "almalinux" && "$os_id" == "alma" ]] && id_ok=1
+        (( id_ok )) || continue
+
+        # Version prefix match: "8" matches "8.0", "8.7", "8.10", etc.
+        [[ "$os_ver" == "${p_ver_prefix}"   ]] && { matched=1; OS_FAMILY="$p_family"; OS_CODENAME="$p_codename"; break; }
+        [[ "$os_ver" == "${p_ver_prefix}."* ]] && { matched=1; OS_FAMILY="$p_family"; OS_CODENAME="$p_codename"; break; }
+    done
+
+    # ── 6. Unsupported — build suggestion and exit ────────────────────────────
+    if (( ! matched )); then
+        local suggestion=""
+        case "$os_id" in
+            centos)
+                suggestion="CentOS is end-of-life and not supported.\nMigrate to AlmaLinux 8 or 9 (1:1 binary compatible).\nGuide: https://wiki.almalinux.org/documentation/migration-guide.html"
+                ;;
+            rocky|rockylinux)
+                suggestion="Rocky Linux is not supported.\nAlmaLinux 8 or 9 is the recommended alternative."
+                ;;
+            rhel|redhat)
+                local rv="${os_ver%%.*}"
+                if [[ "$rv" == "8" || "$rv" == "9" ]]; then
+                    suggestion="RHEL ${rv} is not supported directly.\nAlmaLinux ${rv} is a free, 1:1 RHEL-compatible alternative."
+                else
+                    suggestion="RHEL is not supported. Use AlmaLinux 8 or 9."
+                fi
+                ;;
+            ubuntu)
+                local uv="${os_ver%%.*}"
+                case "$uv" in
+                    18|20) suggestion="Ubuntu ${os_ver} is no longer supported for new installs.\nUpgrade to Ubuntu 22.04 LTS." ;;
+                    23|24) suggestion="Ubuntu ${os_ver} is not an LTS release and is not supported.\nUse Ubuntu 22.04 LTS." ;;
+                    *)     suggestion="Ubuntu ${os_ver} is not supported. Use Ubuntu 22.04 LTS." ;;
+                esac
+                ;;
+            debian)
+                suggestion="Debian is not supported. Use Ubuntu 22.04 LTS instead."
+                ;;
+            fedora)
+                suggestion="Fedora is not supported.\nFor an RPM-based server, use AlmaLinux 9."
+                ;;
+            opensuse*|sles)
+                suggestion="openSUSE / SLES are not supported.\nUse AlmaLinux 9 or Ubuntu 22.04 LTS."
+                ;;
+            arch|manjaro)
+                suggestion="Arch-based distributions are not supported.\nUse Ubuntu 22.04 LTS or AlmaLinux 9."
+                ;;
+        esac
+
+        _os_die "$os_pretty" "$os_id" "$os_ver" "$arch" "$suggestion"
+    fi
+
+    # ── 7. Validation passed — report and continue ────────────────────────────
+    log "OS validated: ${os_pretty}"
+    info "  ID: ${os_id}  |  Version: ${os_ver}  |  Arch: ${arch}"
+    info "  Family: ${OS_FAMILY}  |  Codename: ${OS_CODENAME}"
 }
 
 # =============================================================================
