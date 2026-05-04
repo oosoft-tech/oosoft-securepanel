@@ -78,6 +78,13 @@ IS_UPGRADE=0            # 1 when an existing installation is detected
 PREV_VERSION=""         # version string from the state file
 UNITS_CHANGED=0         # 1 when at least one systemd unit was updated
 
+# ─── Step tracking ────────────────────────────────────────────────────────────
+# _STEPS_DONE grows as each step() call implicitly closes the previous one.
+# _INSTALL_COMPLETE is set to 1 only after print_banner() — any earlier exit
+# is treated as a partial/failed installation by _on_failure_cleanup().
+_STEPS_DONE=()
+_INSTALL_COMPLETE=0
+
 # ─── Health check result accumulators (parallel-indexed arrays) ───────────────
 _HC_LABELS=()    # display name of each check
 _HC_STATES=()    # "pass" | "fail" for each check
@@ -111,7 +118,13 @@ err()  { echo -e "${RED}✗${NC}  [$(_ts)] $*"      | tee -a "$INSTALL_LOG" >&2;
 skip() { echo -e "      ${DIM}↷  $* — skipped (already done)${NC}" | tee -a "$INSTALL_LOG"; }
 die()  { err "$*"; exit 1; }
 step() {
-    _CURRENT_STEP="$*"   # captured by _on_error if this step fails
+    # Closing the previous step: push it to _STEPS_DONE before starting the new
+    # one.  This means on failure _STEPS_DONE contains everything that *fully*
+    # finished, and _CURRENT_STEP is the one that was running when we died.
+    if [[ -n "$_CURRENT_STEP" ]]; then
+        _STEPS_DONE+=("$_CURRENT_STEP")
+    fi
+    _CURRENT_STEP="$*"
     echo | tee -a "$INSTALL_LOG"
     echo -e "${CYAN}${BOLD}━━  $*  ━━${NC}" | tee -a "$INSTALL_LOG"
 }
@@ -220,6 +233,9 @@ _on_error() {
         echo
     } | tee -a "$INSTALL_LOG" >&2
 
+    # Print step summary + stop services + cleanup instructions.
+    _on_failure_cleanup
+
     # Exit with the original code; _on_exit fires next and prints the footer.
     exit "$exit_code"
 }
@@ -234,6 +250,7 @@ _on_interrupt() {
         echo -e "  ${DIM}The installer is idempotent — re-run to resume.${NC}"
         echo
     } | tee -a "$INSTALL_LOG" >&2
+    _on_failure_cleanup
     exit 130   # 128 + SIGINT(2)
 }
 
@@ -245,6 +262,7 @@ _on_terminate() {
         echo -e "  ${DIM}The installer is idempotent — re-run to resume.${NC}"
         echo
     } | tee -a "$INSTALL_LOG" >&2
+    _on_failure_cleanup
     exit 143   # 128 + SIGTERM(15)
 }
 
@@ -253,6 +271,145 @@ trap '_on_error'     ERR
 trap '_on_exit'      EXIT
 trap '_on_interrupt' INT
 trap '_on_terminate' TERM
+
+# =============================================================================
+# FAILURE HANDLING — STEP SUMMARY, SERVICE STOP, CLEANUP INSTRUCTIONS
+#
+# _on_failure_cleanup() is called by _on_error() and both signal handlers
+# before they exit.  It:
+#   1. Skips entirely when _INSTALL_COMPLETE=1 (clean exit — nothing to do).
+#   2. Prints a two-column step summary: ✓ completed vs ✗ failed.
+#   3. Stops any panel services that were running (avoids leaving a
+#      half-configured daemon in an active+broken state).
+#   4. Prints precise copy-paste cleanup commands scoped to what was actually
+#      installed — only the blocks for completed steps are shown.
+# =============================================================================
+
+# Return 0 if the named step appears in _STEPS_DONE (i.e. fully completed).
+_step_done() {
+    local target="$1" s
+    for s in "${_STEPS_DONE[@]+"${_STEPS_DONE[@]}"}"; do
+        [[ "$s" == "$target" ]] && return 0
+    done
+    return 1
+}
+
+# Print copy-paste cleanup commands scoped to what was actually installed.
+_print_cleanup_instructions() {
+    local has_units=0 has_nginx=0 has_db=0 has_files=0 has_users=0
+
+    _step_done "Installing systemd service units"       && has_units=1
+    _step_done "Configuring nginx"                      && has_nginx=1
+    _step_done "Configuring PostgreSQL"                 && has_db=1
+    _step_done "Deploying application from repository"  && has_files=1
+    _step_done "Creating directory structure"           && has_files=1
+    _step_done "Creating system users and groups"       && has_users=1
+
+    # Nothing meaningful was installed yet — skip the block entirely.
+    (( has_units || has_nginx || has_db || has_files || has_users )) || return 0
+
+    {
+        echo -e "  ${BOLD}Cleanup commands${NC}  ${DIM}(run as root to remove this partial installation)${NC}"
+        echo
+
+        if (( has_units )); then
+            echo    "    # Disable and remove systemd units"
+            echo    "    systemctl disable --now \\"
+            echo    "        securepanel securepanel-agent \\"
+            echo    "        securepanel-worker securepanel-beat \\"
+            echo    "        certbot-renewal.timer 2>/dev/null || true"
+            echo    "    rm -f /etc/systemd/system/securepanel*.service"
+            echo    "    rm -f /etc/systemd/system/certbot-renewal.{service,timer}"
+            echo    "    systemctl daemon-reload"
+            echo
+        fi
+
+        if (( has_nginx )); then
+            echo    "    # Remove nginx panel config"
+            echo    "    rm -f /etc/nginx/conf.d/panel.conf"
+            echo    "    rm -f /etc/nginx/snippets/ssl-params.conf"
+            echo    "    systemctl reload nginx 2>/dev/null || true"
+            echo
+        fi
+
+        if (( has_db )); then
+            echo    "    # Remove PostgreSQL role and database"
+            echo    "    sudo -u postgres psql -c \"DROP DATABASE IF EXISTS securepanel;\""
+            echo    "    sudo -u postgres psql -c \"DROP USER     IF EXISTS securepanel;\""
+            echo
+        fi
+
+        if (( has_files )); then
+            echo    "    # Remove application files and logs"
+            echo    "    rm -rf  ${INSTALL_DIR}"
+            echo    "    rm -rf  ${LOG_DIR}  ${STATE_DIR}"
+            echo    "    rm -f   /etc/tmpfiles.d/securepanel.conf"
+            echo    "    rm -f   /etc/logrotate.d/securepanel"
+            echo    "    rm -f   ${INSTALL_LOG}"
+            echo
+        fi
+
+        if (( has_users )); then
+            echo    "    # Remove system user and groups"
+            echo    "    userdel  ${PANEL_USER}   2>/dev/null || true"
+            echo    "    groupdel ${PANEL_GROUP}  2>/dev/null || true"
+            echo    "    groupdel ${HOSTING_GROUP} 2>/dev/null || true"
+            echo
+        fi
+
+        echo -e "  ${DIM}After cleanup, fix the issue and re-run:${NC}"
+        echo -e "  ${DIM}    curl -sSL https://oosoft.co.in/install.sh | bash${NC}"
+        echo
+    } | tee -a "$INSTALL_LOG" >&2
+}
+
+# Main failure handler — called by _on_error, _on_interrupt, _on_terminate.
+_on_failure_cleanup() {
+    # Nothing to clean up on a successful exit.
+    (( _INSTALL_COMPLETE )) && return 0
+
+    # ── Step progress summary ─────────────────────────────────────────────────
+    {
+        echo -e "${YELLOW}${BOLD}━━  Installation Progress  ━━${NC}"
+        echo
+
+        if (( ${#_STEPS_DONE[@]} > 0 )); then
+            echo -e "  ${GREEN}✓${NC}  Completed (${#_STEPS_DONE[@]}):"
+            local s
+            for s in "${_STEPS_DONE[@]}"; do
+                echo "       • $s"
+            done
+        else
+            echo -e "  ${DIM}  No steps completed.${NC}"
+        fi
+
+        if [[ -n "$_CURRENT_STEP" ]]; then
+            echo
+            echo -e "  ${RED}✗${NC}  Failed during:  ${BOLD}$_CURRENT_STEP${NC}"
+        fi
+        echo
+    } | tee -a "$INSTALL_LOG" >&2
+
+    # ── Stop services if they were started ────────────────────────────────────
+    if _step_done "Enabling and starting panel services"; then
+        {
+            echo -e "  ${YELLOW}Stopping services started before failure...${NC}"
+        } | tee -a "$INSTALL_LOG" >&2
+
+        local svc
+        for svc in securepanel-beat securepanel-worker securepanel securepanel-agent; do
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                systemctl stop "$svc" 2>/dev/null \
+                    && echo "    stopped: $svc" | tee -a "$INSTALL_LOG" >&2 \
+                    || true
+            fi
+        done
+        echo | tee -a "$INSTALL_LOG" >&2
+    fi
+
+    # ── Scoped cleanup instructions ───────────────────────────────────────────
+    _print_cleanup_instructions
+}
 
 # =============================================================================
 # .ENV HELPERS
@@ -1741,6 +1898,12 @@ main() {
 
     # Persist state for future runs
     _write_state
+
+    # Close the last step and mark the install as complete.
+    # _on_failure_cleanup() checks this flag and no-ops on a clean exit.
+    [[ -n "$_CURRENT_STEP" ]] && _STEPS_DONE+=("$_CURRENT_STEP")
+    _CURRENT_STEP=""
+    _INSTALL_COMPLETE=1
 
     print_banner
 }
