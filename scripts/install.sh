@@ -25,8 +25,9 @@
 #   REPO_URL          Override Git repository URL
 #   DB_PASSWORD       Use a specific DB password (auto-generated if unset)
 #   FORCE_VENV=1      Recreate the Python venv even if it already looks good
-#   FORCE_NGINX=1     Overwrite the nginx config even if HTTPS is already live
-#   PANEL_DEBUG=1     Enable bash -x trace output for step-by-step debugging
+#   FORCE_NGINX=1        Overwrite the nginx config even if HTTPS is already live
+#   PANEL_DEBUG=1        Enable bash -x trace output for step-by-step debugging
+#   PANEL_SKIP_HEALTH=1  Skip post-install health checks (useful in CI)
 # =============================================================================
 set -euo pipefail
 IFS=$'\n\t'
@@ -68,6 +69,7 @@ DB_PASSWORD="${DB_PASSWORD:-}"
 SECRET_KEY="${SECRET_KEY:-}"
 FORCE_VENV="${FORCE_VENV:-0}"
 FORCE_NGINX="${FORCE_NGINX:-0}"
+PANEL_SKIP_HEALTH="${PANEL_SKIP_HEALTH:-0}"
 
 # ─── Runtime state (set during execution) ────────────────────────────────────
 OS_FAMILY=""            # "rhel" | "debian"
@@ -75,6 +77,12 @@ OS_CODENAME=""          # "al8" | "al9" | "jammy"
 IS_UPGRADE=0            # 1 when an existing installation is detected
 PREV_VERSION=""         # version string from the state file
 UNITS_CHANGED=0         # 1 when at least one systemd unit was updated
+
+# ─── Health check result accumulators (parallel-indexed arrays) ───────────────
+_HC_LABELS=()    # display name of each check
+_HC_STATES=()    # "pass" | "fail" for each check
+_HC_DETAILS=()   # one-line result shown in the table
+_HC_HINTS=()     # diagnostic command shown under a failing entry
 
 # ─── Installer timing + step context ─────────────────────────────────────────
 _INSTALL_START=$(date +%s)   # wall-clock seconds at launch; used for elapsed time
@@ -1387,6 +1395,161 @@ start_services() {
 }
 
 # =============================================================================
+# POST-INSTALL HEALTH CHECKS
+#
+# Runs immediately after start_services().  Every critical component is probed
+# and the results are printed as a pass/fail table.  Any failure causes a hard
+# abort with targeted diagnostic commands so the operator knows exactly where
+# to look without reading the full log.
+#
+# Checks performed:
+#   1. securepanel-agent  — systemctl is-active
+#   2. securepanel        — systemctl is-active
+#   3. nginx              — systemctl is-active
+#   4. agent socket       — file exists and is a socket
+#   5. HTTP probe         — curl localhost returns any HTTP response
+#
+# Set PANEL_SKIP_HEALTH=1 to bypass all checks (e.g. in automated testing
+# where services may not be fully started at health-check time).
+# =============================================================================
+
+# Record a passing check result.
+_hc_pass() {
+    local label="$1" detail="${2:-ok}"
+    _HC_LABELS+=("$label")
+    _HC_STATES+=("pass")
+    _HC_DETAILS+=("$detail")
+    _HC_HINTS+=("")
+}
+
+# Record a failing check result.
+# $3 = one-liner diagnostic command shown in the failure summary.
+_hc_fail() {
+    local label="$1" detail="${2:-failed}" hint="${3:-}"
+    _HC_LABELS+=("$label")
+    _HC_STATES+=("fail")
+    _HC_DETAILS+=("$detail")
+    _HC_HINTS+=("$hint")
+}
+
+# Check that a systemd service is in the "active" state.
+_hc_service() {
+    local svc="$1"
+    local state
+    state=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+    if [[ "$state" == "active" ]]; then
+        _hc_pass "$svc" "active"
+    else
+        _hc_fail "$svc" "$state" \
+            "journalctl -u ${svc} -n 50 --no-pager"
+    fi
+}
+
+# Check that a path exists and is a Unix-domain socket (not a regular file).
+_hc_socket() {
+    local label="$1" path="$2"
+    if [[ -S "$path" ]]; then
+        _hc_pass "$label" "$path"
+    else
+        local reason="missing"
+        [[ -e "$path" ]] && reason="exists but is not a socket"
+        _hc_fail "$label" "$reason: $path" \
+            "systemctl restart securepanel-agent  &&  ls -la ${path}"
+    fi
+}
+
+# Make an HTTP probe to the given URL.  Any HTTP response (including 503)
+# counts as a pass — it means nginx is up and routing requests.
+# A connection refusal or timeout is a fail.
+_hc_http() {
+    local label="$1" url="$2"
+    if ! command -v curl &>/dev/null; then
+        _hc_pass "$label" "skipped (curl not available)"
+        return
+    fi
+    local http_code="000"
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time 5 --connect-timeout 3 "$url" 2>/dev/null) || true
+    if [[ -n "$http_code" && "$http_code" != "000" ]]; then
+        _hc_pass "$label" "HTTP $http_code"
+    else
+        _hc_fail "$label" "no response (connection refused or timed out)" \
+            "curl -v ${url}  &&  journalctl -u nginx -n 30 --no-pager"
+    fi
+}
+
+run_health_checks() {
+    if [[ "$PANEL_SKIP_HEALTH" == "1" ]]; then
+        warn "PANEL_SKIP_HEALTH=1 — post-install health checks skipped."
+        return 0
+    fi
+
+    step "Post-install health checks"
+
+    # Give recently-restarted services a moment to finish initialising before
+    # probing — avoids false negatives from an activating service.
+    sleep 3
+
+    # ── Run all checks ────────────────────────────────────────────────────────
+    _hc_service "securepanel-agent"
+    _hc_service "securepanel"
+    _hc_service "nginx"
+    _hc_socket  "agent socket"  "${RUN_DIR}/agent.sock"
+    _hc_http    "HTTP probe"    "http://127.0.0.1/"
+
+    # ── Print results table ───────────────────────────────────────────────────
+    local failures=()
+    local i
+
+    echo | tee -a "$INSTALL_LOG"
+    printf "  %-26s  %s\n" "Check" "Result" \
+        | tee -a "$INSTALL_LOG"
+    printf "  %s\n" \
+        "────────────────────────────────────────────────────" \
+        | tee -a "$INSTALL_LOG"
+
+    for (( i=0; i<${#_HC_LABELS[@]}; i++ )); do
+        if [[ "${_HC_STATES[$i]}" == "pass" ]]; then
+            printf "  ${GREEN}✓${NC}  %-24s  ${GREEN}%s${NC}\n" \
+                "${_HC_LABELS[$i]}" "${_HC_DETAILS[$i]}" \
+                | tee -a "$INSTALL_LOG"
+        else
+            printf "  ${RED}✗${NC}  %-24s  ${RED}%s${NC}\n" \
+                "${_HC_LABELS[$i]}" "${_HC_DETAILS[$i]}" \
+                | tee -a "$INSTALL_LOG"
+            failures+=("$i")
+        fi
+    done
+    echo | tee -a "$INSTALL_LOG"
+
+    # ── All green ─────────────────────────────────────────────────────────────
+    if (( ${#failures[@]} == 0 )); then
+        log "All health checks passed."
+        return 0
+    fi
+
+    # ── Failure summary ───────────────────────────────────────────────────────
+    {
+        echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}${BOLD}║  ✗  ${#failures[@]} health check(s) failed                                  ║${NC}"
+        echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+        echo
+        for i in "${failures[@]}"; do
+            echo -e "  ${RED}✗${NC}  ${BOLD}${_HC_LABELS[$i]}${NC}  —  ${_HC_DETAILS[$i]}"
+            if [[ -n "${_HC_HINTS[$i]}" ]]; then
+                echo -e "      ${DIM}Diagnose:${NC}  ${_HC_HINTS[$i]}"
+            fi
+            echo
+        done
+        echo -e "  ${DIM}Full log: $INSTALL_LOG${NC}"
+        echo -e "  ${DIM}Fix the issues above, then re-run the installer.${NC}"
+        echo
+    } | tee -a "$INSTALL_LOG" >&2
+
+    die "Post-install health checks failed — see diagnostic output above."
+}
+
+# =============================================================================
 # SSL — optional; only runs when PANEL_DOMAIN + ADMIN_EMAIL are set and
 # DNS already resolves. ssl-setup.sh is itself idempotent.
 # =============================================================================
@@ -1476,6 +1639,22 @@ print_banner() {
     done
     echo
 
+    # Surface health-check summary when checks were actually run.
+    if (( ${#_HC_LABELS[@]} > 0 )); then
+        local hc_fails=0
+        local i
+        for (( i=0; i<${#_HC_STATES[@]}; i++ )); do
+            [[ "${_HC_STATES[$i]}" == "fail" ]] && (( hc_fails++ )) || true
+        done
+        echo -e "  ${BOLD}Health checks:${NC}"
+        if (( hc_fails == 0 )); then
+            echo -e "    ${GREEN}✓${NC}  All ${#_HC_LABELS[@]} checks passed"
+        else
+            echo -e "    ${RED}✗${NC}  ${hc_fails} of ${#_HC_LABELS[@]} check(s) failed — see log for details"
+        fi
+        echo
+    fi
+
     if [[ -z "$PANEL_DOMAIN" ]] \
        || [[ ! -f "/etc/letsencrypt/live/${PANEL_DOMAIN:-}/fullchain.pem" ]]; then
         echo -e "  ${YELLOW}${BOLD}Next steps:${NC}"
@@ -1557,6 +1736,7 @@ main() {
     setup_nginx
     setup_firewall
     start_services
+    run_health_checks
     maybe_setup_ssl
 
     # Persist state for future runs
