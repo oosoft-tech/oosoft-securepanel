@@ -443,6 +443,81 @@ _env_ensure() {
 }
 
 # =============================================================================
+# SECRET GENERATION HELPERS
+#
+# All random secrets go through _gen_secret() so there is exactly one source
+# of entropy in the installer.  Generation order:
+#   1. Python secrets.token_urlsafe  — CSPRNG, URL-safe base64, no padding
+#   2. openssl rand -hex             — falls back when venv not ready
+#   3. /dev/urandom + tr             — last resort
+#
+# _validate_secret() is called on every newly-generated value and is a hard
+# stop — a truncated or empty token means the entropy source is broken.
+#
+# _warn_weak_secret() is the soft variant for upgrade paths where an existing
+# value must NOT be auto-rotated (e.g. SECRET_KEY invalidates all sessions).
+# =============================================================================
+
+# Generate a cryptographically strong URL-safe token.
+# $1 = random bytes to source (default 48 → 384 bits / ~64 chars)
+_gen_secret() {
+    local nbytes="${1:-48}"
+    local token=""
+
+    # Preferred: Python secrets module via the application venv.
+    if [[ -x "${VENV_DIR}/bin/python" ]]; then
+        token=$("${VENV_DIR}/bin/python" -c \
+            "import secrets; print(secrets.token_urlsafe(${nbytes}))" \
+            2>/dev/null || true)
+    fi
+
+    # Fallback 1: openssl (clean hex output — available even pre-venv).
+    if [[ -z "$token" ]] && command -v openssl &>/dev/null; then
+        token=$(openssl rand -hex "$nbytes" 2>/dev/null || true)
+    fi
+
+    # Fallback 2: /dev/urandom directly.
+    if [[ -z "$token" ]] && [[ -r /dev/urandom ]]; then
+        token=$(LC_ALL=C tr -dc 'A-Za-z0-9_-' < /dev/urandom \
+                | head -c $(( nbytes * 2 )) 2>/dev/null || true)
+    fi
+
+    [[ -n "$token" ]] \
+        || die "Secret generation failed — no working entropy source found."
+
+    echo "$token"
+}
+
+# Hard validation: die if the value is empty or below the minimum length.
+# Use this on every freshly generated secret before writing to disk.
+# $1 = variable name (for error message), $2 = value, $3 = min chars (default 32)
+_validate_secret() {
+    local name="$1" value="$2" min="${3:-32}"
+    if [[ -z "$value" ]]; then
+        die "${name}: generated value is empty — entropy source may be broken."
+    fi
+    if (( ${#value} < min )); then
+        die "${name}: generated value is only ${#value} chars (minimum ${min})."
+    fi
+}
+
+# Soft validation for existing .env values on upgrade.
+# Warns the operator but never rotates — rotating SECRET_KEY logs out
+# all active users, which is a disruptive change that must be manual.
+# $1 = variable name, $2 = value, $3 = min chars (default 32)
+_warn_weak_secret() {
+    local name="$1" value="$2" min="${3:-32}"
+    if [[ -z "$value" ]]; then
+        warn "${name} is missing from .env — will be appended."
+        return
+    fi
+    if (( ${#value} < min )); then
+        warn "${name} is only ${#value} chars (minimum ${min} recommended)."
+        warn "  To rotate: update ${name} in ${BACKEND_DIR}/.env and restart services."
+    fi
+}
+
+# =============================================================================
 # STATE FILE
 # Tracks installed version and first-install metadata across runs.
 # =============================================================================
@@ -1049,113 +1124,154 @@ setup_redis() {
 # ENVIRONMENT FILE (.env)
 #
 # Idempotency rules:
-#   • Fresh install  — write the full template.
+#   • Fresh install  — generate all secrets, write the full template.
 #   • Re-run / upgrade — NEVER overwrite existing keys.
-#     We only append keys that are entirely missing from the file.
-#     SECRET_KEY and DATABASE_URL are preserved 100% of the time.
+#     Only append keys that are entirely absent from the file.
+#     SECRET_KEY and AGENT_TOKEN are preserved 100% — rotating them is
+#     a deliberate, manual operator action (SECRET_KEY logs out all users;
+#     AGENT_TOKEN requires agent + API restart in lockstep).
+#
+# Permissions: 600 owned by PANEL_USER — only the service account and root
+#   can read the file.  Re-enforced on every run regardless of path taken.
 # =============================================================================
 
 generate_env() {
-    step "Configuring .env"
+    step "Configuring environment (.env)"
 
     local env_file="${BACKEND_DIR}/.env"
-    local python_bin="${VENV_DIR}/bin/python"
 
-    if [[ -f "$env_file" ]]; then
-        # ── Upgrade path: file already exists ────────────────────────────────
-        log ".env already exists — preserving all existing values."
-        info "Checking for any missing keys and adding defaults..."
+    # ── Resolve / generate all secrets before touching the file ──────────────
+    # Order matters: read existing values first so we never silently replace
+    # a credential that production is already using.
 
-        # Derive SECRET_KEY from file so generate logic below is consistent
+    # SECRET_KEY — JWT signing key.
+    # MUST NOT be auto-rotated on upgrade; warn if weak, never replace.
+    if [[ -z "$SECRET_KEY" ]]; then
         SECRET_KEY=$(_env_get "SECRET_KEY")
-        [[ -n "$SECRET_KEY" ]] || \
-            SECRET_KEY=$("$python_bin" -c "import secrets; print(secrets.token_hex(32))")
+    fi
+    if [[ -n "$SECRET_KEY" ]]; then
+        # Upgrade path: validate the existing key but do not replace it.
+        _warn_weak_secret "SECRET_KEY" "$SECRET_KEY" 43
+    else
+        # Fresh install: generate 384-bit URL-safe token.
+        SECRET_KEY=$(_gen_secret 48)
+        _validate_secret "SECRET_KEY" "$SECRET_KEY" 43
+        info "  SECRET_KEY: generated (${#SECRET_KEY} chars, 384-bit)"
+    fi
 
-        # Build ALLOWED_HOSTS / CORS values if not already in file
-        local allowed_hosts='["*"]'
-        local cors_origins='[]'
-        if [[ -n "$PANEL_DOMAIN" ]]; then
-            allowed_hosts="[\"${PANEL_DOMAIN}\"]"
-            cors_origins="[\"https://${PANEL_DOMAIN}\"]"
-        fi
+    # AGENT_TOKEN — shared secret for API ↔ privileged-agent socket auth.
+    # Present on fresh installs; appended on upgrades from older versions.
+    local agent_token
+    agent_token=$(_env_get "AGENT_TOKEN")
+    if [[ -n "$agent_token" ]]; then
+        _warn_weak_secret "AGENT_TOKEN" "$agent_token" 32
+    else
+        agent_token=$(_gen_secret 32)
+        _validate_secret "AGENT_TOKEN" "$agent_token" 32
+        info "  AGENT_TOKEN: generated (${#agent_token} chars, 256-bit)"
+    fi
 
-        # Ensure every expected key is present — _env_ensure is a no-op
-        # if the key already exists, so this is always safe.
-        _env_ensure "APP_ENV"              "production"
-        _env_ensure "SECRET_KEY"           "$SECRET_KEY"
-        _env_ensure "ALLOWED_HOSTS"        "$allowed_hosts"
-        _env_ensure "CORS_ORIGINS"         "$cors_origins"
-        _env_ensure "DATABASE_URL"         "postgresql+asyncpg://securepanel:${DB_PASSWORD}@127.0.0.1:5432/securepanel"
-        _env_ensure "REDIS_URL"            "redis://127.0.0.1:6379/0"
-        _env_ensure "CELERY_BROKER_URL"    "redis://127.0.0.1:6379/1"
+    # DB_PASSWORD — already resolved (or generated) by setup_postgresql().
+    if [[ -z "$DB_PASSWORD" ]]; then
+        DB_PASSWORD=$(_gen_secret 32)
+        _validate_secret "DB_PASSWORD" "$DB_PASSWORD" 32
+        info "  DB_PASSWORD: generated (${#DB_PASSWORD} chars)"
+    fi
+
+    # ── Build domain-scoped values ────────────────────────────────────────────
+    local allowed_hosts='["*"]'
+    local cors_origins='[]'
+    if [[ -n "$PANEL_DOMAIN" ]]; then
+        allowed_hosts="[\"${PANEL_DOMAIN}\"]"
+        cors_origins="[\"https://${PANEL_DOMAIN}\"]"
+    fi
+
+    # ── Write or update the file ──────────────────────────────────────────────
+    if [[ -f "$env_file" ]]; then
+        # Upgrade path: file exists — only append missing keys, never overwrite.
+        log ".env exists — preserving all current values, appending missing keys."
+
+        _env_ensure "APP_ENV"               "production"
+        _env_ensure "SECRET_KEY"            "$SECRET_KEY"
+        _env_ensure "AGENT_TOKEN"           "$agent_token"
+        _env_ensure "ALLOWED_HOSTS"         "$allowed_hosts"
+        _env_ensure "CORS_ORIGINS"          "$cors_origins"
+        _env_ensure "DATABASE_URL"          "postgresql+asyncpg://securepanel:${DB_PASSWORD}@127.0.0.1:5432/securepanel"
+        _env_ensure "REDIS_URL"             "redis://127.0.0.1:6379/0"
+        _env_ensure "CELERY_BROKER_URL"     "redis://127.0.0.1:6379/1"
         _env_ensure "CELERY_RESULT_BACKEND" "redis://127.0.0.1:6379/2"
-        _env_ensure "MAIL_DOMAIN"          "${PANEL_DOMAIN:-example.com}"
-        _env_ensure "PANEL_ADMIN_EMAIL"    "${ADMIN_EMAIL:-ssl-admin@localhost}"
-        _env_ensure "ANTHROPIC_API_KEY"    ""
-        _env_ensure "DB_ADMIN_PASSWORD"    ""
+        _env_ensure "MAIL_DOMAIN"           "${PANEL_DOMAIN:-example.com}"
+        _env_ensure "PANEL_ADMIN_EMAIL"     "${ADMIN_EMAIL:-ssl-admin@localhost}"
+        _env_ensure "ANTHROPIC_API_KEY"     ""
+        _env_ensure "DB_ADMIN_PASSWORD"     ""
 
         log ".env: all required keys present."
     else
-        # ── Fresh install: write the full template ────────────────────────────
+        # Fresh install: write the full annotated template atomically.
         log "Writing .env (fresh install)..."
 
-        [[ -z "$SECRET_KEY"  ]] && \
-            SECRET_KEY=$("$python_bin" -c "import secrets; print(secrets.token_hex(32))")
-        [[ -z "$DB_PASSWORD" ]] && \
-            DB_PASSWORD=$("$python_bin" -c "import secrets; print(secrets.token_urlsafe(32))")
+        # Write to a temp file first; move into place only when complete.
+        # This prevents a partial .env from being read if we are interrupted.
+        local tmp_env
+        tmp_env=$(_mktemp)
 
-        local allowed_hosts='["*"]'
-        local cors_origins='[]'
-        if [[ -n "$PANEL_DOMAIN" ]]; then
-            allowed_hosts="[\"${PANEL_DOMAIN}\"]"
-            cors_origins="[\"https://${PANEL_DOMAIN}\"]"
-        fi
-
-        cat > "$env_file" << ENV
-# ============================================================
+        cat > "$tmp_env" << ENV
+# ================================================================
 # Oosoft SecurePanel — Runtime Configuration
-# Generated: $(date -Iseconds)
-# !! KEEP SECRET — contains credentials and signing keys !!
-# ============================================================
+# Generated : $(date -Iseconds)
+# !! KEEP SECRET — this file contains credentials and key material !!
+# ================================================================
 
 APP_ENV=production
 
-# ── JWT signing key ──────────────────────────────────────────
-# Changing this invalidates ALL active sessions. Rotate only
-# when absolutely required.
+# ── JWT signing key ──────────────────────────────────────────────
+# Rotating this value invalidates ALL active user sessions.
+# Only rotate when required (e.g. after a suspected key compromise).
+# To rotate: generate a new value, update this file, restart services.
 SECRET_KEY=${SECRET_KEY}
 
-# ── Allowed hosts / CORS ─────────────────────────────────────
+# ── Privileged-agent authentication token ────────────────────────
+# Shared secret used by the API to authenticate requests to the
+# local privileged agent over its Unix-domain socket.
+# Rotating this requires restarting BOTH securepanel AND
+# securepanel-agent in lockstep, or the API will be rejected.
+AGENT_TOKEN=${agent_token}
+
+# ── Allowed hosts / CORS origins ────────────────────────────────
 ALLOWED_HOSTS=${allowed_hosts}
 CORS_ORIGINS=${cors_origins}
 
-# ── Database ─────────────────────────────────────────────────
+# ── Database ─────────────────────────────────────────────────────
 DATABASE_URL=postgresql+asyncpg://securepanel:${DB_PASSWORD}@127.0.0.1:5432/securepanel
 
-# ── Redis / Celery ───────────────────────────────────────────
+# ── Redis / Celery ───────────────────────────────────────────────
 REDIS_URL=redis://127.0.0.1:6379/0
 CELERY_BROKER_URL=redis://127.0.0.1:6379/1
 CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/2
 
-# ── Mail ─────────────────────────────────────────────────────
+# ── Mail ─────────────────────────────────────────────────────────
 MAIL_DOMAIN=${PANEL_DOMAIN:-example.com}
 
-# ── SSL / Certbot ────────────────────────────────────────────
+# ── SSL / Let's Encrypt ──────────────────────────────────────────
 PANEL_ADMIN_EMAIL=${ADMIN_EMAIL:-ssl-admin@localhost}
 
-# ── AI Assistant (optional) ──────────────────────────────────
+# ── AI assistant (optional) ──────────────────────────────────────
 ANTHROPIC_API_KEY=
 
-# ── MySQL admin (for database-management features) ───────────
+# ── MySQL/MariaDB admin credential (database-management feature) ─
 DB_ADMIN_PASSWORD=
 ENV
+
+        mv "$tmp_env" "$env_file"
     fi
 
-    # Enforce strict permissions on every run
-    chown "root:$PANEL_GROUP" "$env_file"
-    chmod 640 "$env_file"
+    # ── Enforce strict permissions on every run ───────────────────────────────
+    # Mode 600: only the service account (owner) and root can read this file.
+    # 640 (group-readable) is intentionally avoided — .env contains key material.
+    chown "${PANEL_USER}:${PANEL_GROUP}" "$env_file"
+    chmod 600 "$env_file"
 
-    info "  $env_file  (mode 640, owner root:${PANEL_GROUP})"
+    info "  $env_file  (mode 600, owner ${PANEL_USER}:${PANEL_GROUP})"
 }
 
 # =============================================================================
