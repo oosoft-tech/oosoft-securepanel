@@ -26,9 +26,13 @@
 #   DB_PASSWORD       Use a specific DB password (auto-generated if unset)
 #   FORCE_VENV=1      Recreate the Python venv even if it already looks good
 #   FORCE_NGINX=1     Overwrite the nginx config even if HTTPS is already live
+#   PANEL_DEBUG=1     Enable bash -x trace output for step-by-step debugging
 # =============================================================================
 set -euo pipefail
 IFS=$'\n\t'
+
+# Trace mode: enable before anything else so every subsequent command is logged.
+[[ "${PANEL_DEBUG:-0}" == "1" ]] && set -x
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 readonly INSTALLER_VERSION="1.1.0"
@@ -72,6 +76,15 @@ IS_UPGRADE=0            # 1 when an existing installation is detected
 PREV_VERSION=""         # version string from the state file
 UNITS_CHANGED=0         # 1 when at least one systemd unit was updated
 
+# ─── Installer timing + step context ─────────────────────────────────────────
+_INSTALL_START=$(date +%s)   # wall-clock seconds at launch; used for elapsed time
+_CURRENT_STEP=""             # set by step(); shown in every error message
+
+# ─── Temp file registry ───────────────────────────────────────────────────────
+# All mktemp calls MUST go through _mktemp() so the EXIT trap can clean up
+# even when the script is killed mid-function.
+_TMP_FILES=()
+
 # ─── Colours (disabled when stdout is not a terminal) ─────────────────────────
 if [[ -t 1 ]]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -90,18 +103,148 @@ err()  { echo -e "${RED}✗${NC}  [$(_ts)] $*"      | tee -a "$INSTALL_LOG" >&2;
 skip() { echo -e "      ${DIM}↷  $* — skipped (already done)${NC}" | tee -a "$INSTALL_LOG"; }
 die()  { err "$*"; exit 1; }
 step() {
+    _CURRENT_STEP="$*"   # captured by _on_error if this step fails
     echo | tee -a "$INSTALL_LOG"
     echo -e "${CYAN}${BOLD}━━  $*  ━━${NC}" | tee -a "$INSTALL_LOG"
 }
 
-# ─── Error trap ───────────────────────────────────────────────────────────────
-trap '_on_error $LINENO' ERR
-_on_error() {
-    err "Fatal error at line $1."
-    err "Full log: $INSTALL_LOG"
-    err "The installer is idempotent — fix the issue and re-run."
-    exit 1
+# =============================================================================
+# FAIL-FAST ERROR HANDLING
+#
+# Four traps wired up at the bottom of this section:
+#   ERR   — _on_error   : fires on every unhandled non-zero exit; prints a
+#                         rich diagnostic block and re-exits with the original
+#                         exit code.
+#   EXIT  — _on_exit    : runs unconditionally on any exit; removes temp files
+#                         and prints a failure footer when exit code != 0.
+#   INT   — _on_interrupt: clean message for Ctrl-C (exit 130).
+#   TERM  — _on_terminate: clean message for kill/SIGTERM (exit 143).
+#
+# set -e + set -u + set -o pipefail are already active (line 30).
+# =============================================================================
+
+# ─── Temp file helper ─────────────────────────────────────────────────────────
+# Drop-in replacement for mktemp.  Registers the path so _on_exit can remove
+# it even if the script is killed between mktemp and rm -f.
+_mktemp() {
+    local tmp
+    tmp=$(mktemp "$@")
+    _TMP_FILES+=("$tmp")
+    echo "$tmp"
 }
+
+# ─── EXIT trap ────────────────────────────────────────────────────────────────
+# Runs for every exit — success, failure, Ctrl-C, or SIGTERM.
+_on_exit() {
+    local ec=$?
+
+    # Remove all registered temp files silently.
+    local f
+    for f in "${_TMP_FILES[@]+"${_TMP_FILES[@]}"}"; do
+        rm -f "$f" 2>/dev/null || true
+    done
+
+    # Print a concise failure footer only on non-zero exit.
+    # (The success path prints print_banner instead.)
+    if (( ec != 0 )); then
+        local elapsed=$(( $(date +%s) - ${_INSTALL_START:-$(date +%s)} ))
+        {
+            echo
+            echo -e "${RED}${BOLD}  Installation failed after ${elapsed}s  (exit code: ${ec}).${NC}"
+            echo -e "  ${DIM}Full log : $INSTALL_LOG${NC}"
+            echo -e "  ${DIM}The installer is idempotent — fix the issue above and re-run.${NC}"
+            echo
+        } >&2
+    fi
+}
+
+# ─── ERR trap ─────────────────────────────────────────────────────────────────
+# Fired by set -e on every unhandled non-zero command exit.
+# Captures: exit code, the failing command text, source file + line number,
+# the function name, the current install step, elapsed time, and a full call
+# stack so the exact failure site is always visible without reading the log.
+_on_error() {
+    local exit_code=$?
+    local line="${BASH_LINENO[0]}"
+    local cmd="$BASH_COMMAND"
+    local func="${FUNCNAME[1]:-main}"
+    local src
+    src=$(basename "${BASH_SOURCE[1]:-install.sh}")
+    local elapsed=$(( $(date +%s) - ${_INSTALL_START:-$(date +%s)} ))
+
+    # Disable the ERR trap while we print to avoid any accidental re-entry.
+    trap - ERR
+
+    {
+        echo
+        echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}${BOLD}║  ✗  INSTALLER ERROR                                              ║${NC}"
+        echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+        echo
+        echo -e "  ${BOLD}Exit code :${NC}  $exit_code"
+        echo -e "  ${BOLD}Command   :${NC}  $cmd"
+        echo -e "  ${BOLD}Location  :${NC}  $src  line $line  in ${func}()"
+        [[ -n "$_CURRENT_STEP" ]] && \
+            echo -e "  ${BOLD}Step      :${NC}  $_CURRENT_STEP"
+        echo -e "  ${BOLD}Elapsed   :${NC}  ${elapsed}s"
+        echo
+    } | tee -a "$INSTALL_LOG" >&2
+
+    # Print a call stack when there are meaningful frames beyond _on_error itself.
+    if (( ${#FUNCNAME[@]} > 2 )); then
+        {
+            echo -e "  ${BOLD}Call stack:${NC}"
+            local i
+            for (( i=1; i<${#FUNCNAME[@]}; i++ )); do
+                printf "    [%d]  %-35s  %s:%s\n" \
+                    "$i" \
+                    "${FUNCNAME[$i]:-?}" \
+                    "$(basename "${BASH_SOURCE[$i]:-?}")" \
+                    "${BASH_LINENO[$((i-1))]:-?}"
+            done
+            echo
+        } | tee -a "$INSTALL_LOG" >&2
+    fi
+
+    {
+        echo -e "  ${DIM}Full log  :  $INSTALL_LOG${NC}"
+        echo -e "  ${DIM}This script is idempotent — fix the issue above and re-run.${NC}"
+        echo
+    } | tee -a "$INSTALL_LOG" >&2
+
+    # Exit with the original code; _on_exit fires next and prints the footer.
+    exit "$exit_code"
+}
+
+# ─── Signal traps ─────────────────────────────────────────────────────────────
+_on_interrupt() {
+    trap - ERR INT   # prevent double messages
+    echo | tee -a "$INSTALL_LOG" >/dev/null
+    {
+        echo
+        echo -e "${YELLOW}${BOLD}  ⚠  Installation interrupted by user (Ctrl-C / SIGINT).${NC}"
+        echo -e "  ${DIM}The installer is idempotent — re-run to resume.${NC}"
+        echo
+    } | tee -a "$INSTALL_LOG" >&2
+    exit 130   # 128 + SIGINT(2)
+}
+
+_on_terminate() {
+    trap - ERR TERM
+    {
+        echo
+        echo -e "${YELLOW}${BOLD}  ⚠  Installation terminated (SIGTERM).${NC}"
+        echo -e "  ${DIM}The installer is idempotent — re-run to resume.${NC}"
+        echo
+    } | tee -a "$INSTALL_LOG" >&2
+    exit 143   # 128 + SIGTERM(15)
+}
+
+# Register all traps.
+trap '_on_error'     ERR
+trap '_on_exit'      EXIT
+trap '_on_interrupt' INT
+trap '_on_terminate' TERM
 
 # =============================================================================
 # .ENV HELPERS
@@ -873,11 +1016,21 @@ run_migrations() {
     fi
 
     log "alembic upgrade head..."
-    (
+    # Run alembic in a subshell so `cd` does not change the parent's directory.
+    # The `if` construct prevents set -e from triggering on a non-zero exit,
+    # letting us emit a targeted warning instead of a hard abort — migrations
+    # may legitimately be absent on a first run before the schema is finalised.
+    if (
         cd "$BACKEND_DIR"
         DATABASE_URL="$db_url" "$VENV_DIR/bin/alembic" upgrade head
-    ) && log "Migrations: OK" \
-      || warn "Alembic error — run manually and check logs."
+    ); then
+        log "Migrations: OK"
+    else
+        warn "Alembic returned a non-zero exit code."
+        warn "Run manually and verify:"
+        warn "  cd ${BACKEND_DIR} && DATABASE_URL='${db_url}' ${VENV_DIR}/bin/alembic upgrade head"
+        warn "Continuing — check schema state before starting the panel."
+    fi
 }
 
 # =============================================================================
@@ -910,7 +1063,7 @@ install_systemd_services() {
 
         # Prepare a patched copy in a temp file, then compare with destination
         local tmp
-        tmp=$(mktemp)
+        tmp=$(_mktemp)
         cp "$src" "$tmp"
 
         if [[ "$svc" == "securepanel-agent" ]]; then
@@ -1017,7 +1170,7 @@ setup_logrotate() {
 
     local dest="/etc/logrotate.d/securepanel"
     local tmp
-    tmp=$(mktemp)
+    tmp=$(_mktemp)
 
     cat > "$tmp" << 'EOF'
 /var/log/securepanel/*.log {
@@ -1088,7 +1241,7 @@ setup_nginx() {
     # Write bootstrap config
     local bootstrap_src="${INSTALL_DIR}/nginx/panel-bootstrap.conf"
     local tmp
-    tmp=$(mktemp)
+    tmp=$(_mktemp)
 
     if [[ -f "$bootstrap_src" ]]; then
         if [[ -n "$PANEL_DOMAIN" ]]; then
@@ -1115,8 +1268,10 @@ setup_nginx() {
         systemctl restart nginx 2>/dev/null || systemctl start nginx
         log "nginx: running."
     else
-        warn "nginx -t FAILED — check $panel_conf"
-        nginx -t   # print the actual errors
+        # Print the full nginx error output before dying so the operator can
+        # see exactly what is wrong without having to open the log manually.
+        nginx -t 2>&1 | tee -a "$INSTALL_LOG" >&2 || true
+        die "nginx configuration test failed — check $panel_conf and re-run."
     fi
 }
 
